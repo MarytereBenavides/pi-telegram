@@ -53,6 +53,15 @@ The Telegram bridge is session-local. Connect it only in the pi session that sho
 /telegram-connect
 ```
 
+To connect automatically when the session starts (for unattended or scripted
+sessions), set the environment variable before launching pi:
+
+```bash
+PI_TELEGRAM_AUTOCONNECT=1 pi
+```
+
+This only takes effect when a bot token is already configured.
+
 To stop polling in the current session:
 
 ```bash

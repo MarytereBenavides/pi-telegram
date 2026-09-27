@@ -2,9 +2,9 @@ import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
 import { homedir } from "node:os";
 
-import type { ImageContent, TextContent } from "@mariozechner/pi-ai";
-import type { AgentMessage } from "@mariozechner/pi-agent-core";
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 
 interface TelegramConfig {
@@ -415,10 +415,12 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function isAssistantMessage(message: AgentMessage): boolean {
+		// SAFETY: AgentMessage is a union whose variants do not all declare `role`; every field is re-checked at runtime below.
 		return (message as unknown as { role?: string }).role === "assistant";
 	}
 
 	function getMessageText(message: AgentMessage): string {
+		// SAFETY: AgentMessage is a union whose variants do not all declare `content`; every field is re-checked at runtime below.
 		const value = message as unknown as Record<string, unknown>;
 		const content = Array.isArray(value.content) ? value.content : [];
 		return content
@@ -542,6 +544,7 @@ export default function (pi: ExtensionAPI) {
 
 	function extractAssistantText(messages: AgentMessage[]): { text?: string; stopReason?: string; errorMessage?: string } {
 		for (let i = messages.length - 1; i >= 0; i--) {
+			// SAFETY: AgentMessage is a union whose variants do not all declare these fields; each one is type-checked at runtime below.
 			const message = messages[i] as unknown as Record<string, unknown>;
 			if (message.role !== "assistant") continue;
 			const stopReason = typeof message.stopReason === "string" ? message.stopReason : undefined;
@@ -1023,6 +1026,9 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		config = await readConfig();
 		await mkdir(TEMP_DIR, { recursive: true });
+		if (process.env.PI_TELEGRAM_AUTOCONNECT === "1" && config.botToken) {
+			await startPolling(ctx);
+		}
 		updateStatus(ctx);
 	});
 
