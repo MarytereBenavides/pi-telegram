@@ -290,6 +290,7 @@ export default function (pi: ExtensionAPI) {
 	let pollingPromise: Promise<void> | undefined;
 	let queuedTelegramTurns: PendingTelegramTurn[] = [];
 	let activeTelegramTurn: ActiveTelegramTurn | undefined;
+	let telegramTurnRequested = false;
 	let typingInterval: ReturnType<typeof setInterval> | undefined;
 	let currentAbort: (() => void) | undefined;
 	let preserveQueuedTurnsAsHistory = false;
@@ -394,6 +395,10 @@ export default function (pi: ExtensionAPI) {
 		if (typingInterval || targetChatId === undefined) return;
 
 		const sendTyping = async (): Promise<void> => {
+			if (!activeTelegramTurn && queuedTelegramTurns.length === 0) {
+				stopTypingLoop();
+				return;
+			}
 			try {
 				await callTelegram("sendChatAction", { chat_id: targetChatId, action: "typing" });
 			} catch (error) {
@@ -412,6 +417,30 @@ export default function (pi: ExtensionAPI) {
 		if (!typingInterval) return;
 		clearInterval(typingInterval);
 		typingInterval = undefined;
+	}
+
+	function stopTypingLoopIfInactive(): void {
+		if (!activeTelegramTurn && queuedTelegramTurns.length === 0) {
+			stopTypingLoop();
+		}
+	}
+
+	function dispatchNextQueuedTelegramTurn(ctx: ExtensionContext): void {
+		if (!ctx.isIdle() || telegramTurnRequested || activeTelegramTurn || queuedTelegramTurns.length === 0 || preserveQueuedTurnsAsHistory) {
+			stopTypingLoopIfInactive();
+			return;
+		}
+
+		const nextTurn = queuedTelegramTurns[0];
+		if (!nextTurn) {
+			stopTypingLoopIfInactive();
+			return;
+		}
+
+		startTypingLoop(ctx, nextTurn.chatId);
+		updateStatus(ctx);
+		telegramTurnRequested = true;
+		pi.sendUserMessage(nextTurn.content);
 	}
 
 	function isAssistantMessage(message: AgentMessage): boolean {
@@ -841,11 +870,7 @@ export default function (pi: ExtensionAPI) {
 		preserveQueuedTurnsAsHistory = false;
 		const turn = await createTelegramTurn(messages, historyTurns);
 		queuedTelegramTurns.push(turn);
-		if (ctx.isIdle()) {
-			startTypingLoop(ctx, turn.chatId);
-			updateStatus(ctx);
-			pi.sendUserMessage(turn.content);
-		}
+		dispatchNextQueuedTelegramTurn(ctx);
 	}
 
 	async function handleAuthorizedTelegramMessage(message: TelegramMessage, ctx: ExtensionContext): Promise<void> {
@@ -1042,6 +1067,7 @@ export default function (pi: ExtensionAPI) {
 			await clearPreview(activeTelegramTurn.chatId);
 		}
 		activeTelegramTurn = undefined;
+		telegramTurnRequested = false;
 		currentAbort = undefined;
 		preserveQueuedTurnsAsHistory = false;
 		await stopPolling();
@@ -1058,6 +1084,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("agent_start", async (_event, ctx) => {
 		currentAbort = () => ctx.abort();
+		telegramTurnRequested = false;
 		if (!activeTelegramTurn && queuedTelegramTurns.length > 0) {
 			const nextTurn = queuedTelegramTurns.shift();
 			if (nextTurn) {
@@ -1126,11 +1153,7 @@ export default function (pi: ExtensionAPI) {
 
 		await sendQueuedAttachments(turn);
 
-		if (queuedTelegramTurns.length > 0 && !preserveQueuedTurnsAsHistory) {
-			const nextTurn = queuedTelegramTurns[0];
-			startTypingLoop(ctx, nextTurn.chatId);
-			updateStatus(ctx);
-			pi.sendUserMessage(nextTurn.content);
-		}
+		dispatchNextQueuedTelegramTurn(ctx);
+		stopTypingLoopIfInactive();
 	});
 }
