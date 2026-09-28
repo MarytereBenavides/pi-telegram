@@ -297,7 +297,7 @@ export default function (pi: ExtensionAPI) {
 	let preserveQueuedTurnsAsHistory = false;
 	let setupInProgress = false;
 	let previewState: TelegramPreviewState | undefined;
-	let draftSupport: "unknown" | "supported" | "unsupported" = "unknown";
+	let draftSupport: "unknown" | "supported" | "unsupported" = "unsupported";
 	let nextDraftId = 0;
 	const mediaGroups = new Map<string, TelegramMediaGroupState>();
 

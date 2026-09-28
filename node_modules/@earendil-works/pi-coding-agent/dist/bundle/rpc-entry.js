@@ -1,0 +1,3 @@
+#!/usr/bin/env node
+import { createRequire as __piCreateRequire } from "node:module"; const require = __piCreateRequire(import.meta.url);
+import{APP_NAME,configureHttpDispatcher,main}from"./chunks/chunk-OJP47DM6.js";import"./chunks/chunk-XDUWOHPL.js";import"./chunks/chunk-USJZMAIR.js";import"./chunks/chunk-DRQDKNXA.js";import"./chunks/chunk-TRDNDS6A.js";import"./chunks/chunk-RCZIEVGO.js";import"./chunks/chunk-A3JYRWB6.js";import"./chunks/chunk-4L3WN2XY.js";process.title=`${APP_NAME}-rpc`;process.env.PI_CODING_AGENT="true";process.env.AI_AGENT="pi";process.emitWarning=(()=>{});configureHttpDispatcher();main(["--mode","rpc",...process.argv.slice(2)]);
