@@ -141,6 +141,7 @@ interface TelegramPreviewState {
 	mode: "draft" | "message";
 	draftId?: number;
 	messageId?: number;
+	replyToMessageId: number;
 	pendingText: string;
 	lastSentText: string;
 	flushTimer?: ReturnType<typeof setTimeout>;
@@ -500,7 +501,11 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		if (state.messageId === undefined) {
-			const sent = await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: truncated });
+			const sent = await callTelegram<TelegramSentMessage>("sendMessage", {
+				chat_id: chatId,
+				text: truncated,
+				reply_parameters: { message_id: state.replyToMessageId, allow_sending_without_reply: true },
+			});
 			state.messageId = sent.message_id;
 			state.mode = "message";
 			state.lastSentText = truncated;
@@ -1090,7 +1095,7 @@ export default function (pi: ExtensionAPI) {
 			const nextTurn = queuedTelegramTurns.shift();
 			if (nextTurn) {
 				activeTelegramTurn = { ...nextTurn };
-				previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
+				previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", replyToMessageId: nextTurn.replyToMessageId, pendingText: "", lastSentText: "" };
 				startTypingLoop(ctx);
 			}
 		}
@@ -1102,13 +1107,13 @@ export default function (pi: ExtensionAPI) {
 		if (previewState && (previewState.pendingText.trim().length > 0 || previewState.lastSentText.trim().length > 0)) {
 			await finalizePreview(activeTelegramTurn.chatId);
 		}
-		previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
+		previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", replyToMessageId: activeTelegramTurn.replyToMessageId, pendingText: "", lastSentText: "" };
 	});
 
 	pi.on("message_update", async (event, _ctx) => {
 		if (!activeTelegramTurn || !isAssistantMessage(event.message)) return;
 		if (!previewState) {
-			previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
+			previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", replyToMessageId: activeTelegramTurn.replyToMessageId, pendingText: "", lastSentText: "" };
 		}
 		previewState.pendingText = getMessageText(event.message);
 		schedulePreviewFlush(activeTelegramTurn.chatId);
