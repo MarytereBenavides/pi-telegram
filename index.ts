@@ -210,7 +210,8 @@ Telegram bridge extension is active.
 - Messages forwarded from Telegram are prefixed with "[telegram]".
 - [telegram] messages may include local temp file paths for Telegram attachments. Read those files as needed.
 - If a [telegram] user asked for a file or generated artifact, use the telegram_attach tool with the local file path so the extension can send it with your next final reply.
-- Do not assume mentioning a local file path in plain text will send it to Telegram. Use telegram_attach.`;
+- Do not assume mentioning a local file path in plain text will send it to Telegram. Use telegram_attach.
+- When the current message did NOT come from Telegram (for example a notice from another session) and the Telegram user must hear about it, use the telegram_send tool. Otherwise the reply stays in the terminal and never reaches Telegram.`;
 
 function isTelegramPrompt(prompt: string): boolean {
 	return prompt.trimStart().startsWith(TELEGRAM_PREFIX);
@@ -345,6 +346,8 @@ export default function (pi: ExtensionAPI) {
 	const mediaGroups = new Map<string, TelegramMediaGroupState>();
 	const dialogAlerts = new Map<string, DialogAlert>();
 	let lastKnownChatId: number | undefined;
+	/** Files queued by telegram_attach outside a Telegram turn; flushed by the next telegram_send. */
+	let pendingSendAttachments: QueuedAttachment[] = [];
 
 	function allocateDraftId(): number {
 		nextDraftId = nextDraftId >= TELEGRAM_DRAFT_ID_MAX ? 1 : nextDraftId + 1;
@@ -724,21 +727,25 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	async function sendAttachment(chatId: number, attachment: QueuedAttachment): Promise<void> {
+		const mediaType = guessMediaType(attachment.path);
+		const method = mediaType ? "sendPhoto" : "sendDocument";
+		const fieldName = mediaType ? "photo" : "document";
+		await callTelegramMultipart<TelegramSentMessage>(
+			method,
+			{
+				chat_id: String(chatId),
+			},
+			fieldName,
+			attachment.path,
+			attachment.fileName,
+		);
+	}
+
 	async function sendQueuedAttachments(turn: ActiveTelegramTurn): Promise<void> {
 		for (const attachment of turn.queuedAttachments) {
 			try {
-				const mediaType = guessMediaType(attachment.path);
-				const method = mediaType ? "sendPhoto" : "sendDocument";
-				const fieldName = mediaType ? "photo" : "document";
-				await callTelegramMultipart<TelegramSentMessage>(
-					method,
-					{
-						chat_id: String(turn.chatId),
-					},
-					fieldName,
-					attachment.path,
-					attachment.fileName,
-				);
+				await sendAttachment(turn.chatId, attachment);
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				await sendTextReply(turn.chatId, turn.replyToMessageId, `Failed to send attachment ${attachment.fileName}: ${message}`);
@@ -1152,7 +1159,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "telegram_attach",
 		label: "Telegram Attach",
-		description: "Queue one or more local files to be sent with the next Telegram reply.",
+		description: "Queue one or more local files to be sent with the next Telegram reply (or with the next telegram_send call when no Telegram turn is active).",
 		promptSnippet: "Queue local files to be sent with the next Telegram reply.",
 		promptGuidelines: [
 			"When handling a [telegram] message and the user asked for a file or generated artifact, call telegram_attach with the local path instead of only mentioning the path in text.",
@@ -1161,24 +1168,100 @@ export default function (pi: ExtensionAPI) {
 			paths: Type.Array(Type.String({ description: "Local file path to attach" }), { minItems: 1, maxItems: MAX_ATTACHMENTS_PER_TURN }),
 		}),
 		async execute(_toolCallId, params) {
-			if (!activeTelegramTurn) {
-				throw new Error("telegram_attach can only be used while replying to an active Telegram turn");
-			}
+			// Outside a Telegram turn there is no final reply to carry the files, so they wait
+			// for the next telegram_send instead.
+			const queue = activeTelegramTurn ? activeTelegramTurn.queuedAttachments : pendingSendAttachments;
 			const added: string[] = [];
 			for (const inputPath of params.paths) {
 				const stats = await stat(inputPath);
 				if (!stats.isFile()) {
 					throw new Error(`Not a file: ${inputPath}`);
 				}
-				if (activeTelegramTurn.queuedAttachments.length >= MAX_ATTACHMENTS_PER_TURN) {
+				if (queue.length >= MAX_ATTACHMENTS_PER_TURN) {
 					throw new Error(`Attachment limit reached (${MAX_ATTACHMENTS_PER_TURN})`);
 				}
-				activeTelegramTurn.queuedAttachments.push({ path: inputPath, fileName: basename(inputPath) });
+				queue.push({ path: inputPath, fileName: basename(inputPath) });
 				added.push(inputPath);
 			}
+			const target = activeTelegramTurn ? "the next Telegram reply" : "the next telegram_send call";
 			return {
-				content: [{ type: "text", text: `Queued ${added.length} Telegram attachment(s).` }],
+				content: [{ type: "text", text: `Queued ${added.length} Telegram attachment(s) for ${target}.` }],
 				details: { paths: added },
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "telegram_send",
+		label: "Telegram Send",
+		description:
+			"Send a message (and optional local files) to the paired Telegram chat right now, even when the current turn did not come from Telegram.",
+		promptSnippet: "Proactively message the paired Telegram user, outside a Telegram turn.",
+		promptGuidelines: [
+			"Use telegram_send when the Telegram user must learn something and the current message did not come from Telegram (e.g. a notice from another session). Replies to [telegram] messages are delivered automatically; do not duplicate them with telegram_send.",
+		],
+		parameters: Type.Object({
+			text: Type.String({ description: "Message text to send" }),
+			attachments: Type.Optional(
+				Type.Array(Type.String({ description: "Local file path to send after the text" }), { maxItems: MAX_ATTACHMENTS_PER_TURN }),
+			),
+		}),
+		async execute(_toolCallId, params) {
+			if (!config.botToken) {
+				throw new Error("Telegram bridge is not configured. Run /telegram-setup in the pi terminal.");
+			}
+			if (!pollingController) {
+				throw new Error("Telegram bridge is not connected. Run /telegram-connect in the pi terminal; nothing was sent.");
+			}
+			const chatId = resolveAlertChatId();
+			if (chatId === undefined) {
+				throw new Error("Telegram bridge is not paired with any chat yet. Send /start to the bot first; nothing was sent.");
+			}
+
+			const attachments: QueuedAttachment[] = [...pendingSendAttachments];
+			for (const inputPath of params.attachments ?? []) {
+				const stats = await stat(inputPath);
+				if (!stats.isFile()) {
+					throw new Error(`Not a file: ${inputPath}`);
+				}
+				attachments.push({ path: inputPath, fileName: basename(inputPath) });
+			}
+			if (attachments.length > MAX_ATTACHMENTS_PER_TURN) {
+				throw new Error(`Attachment limit reached (${MAX_ATTACHMENTS_PER_TURN})`);
+			}
+			const text = params.text.trim();
+			if (!text && attachments.length === 0) {
+				throw new Error("telegram_send needs non-empty text or at least one attachment");
+			}
+
+			let messages = 0;
+			if (text) {
+				for (const chunk of chunkParagraphs(text)) {
+					await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: chunk });
+					messages++;
+				}
+			}
+			// The queued files are consumed by this call whether or not each upload succeeds;
+			// failures are reported back so the agent can retry them explicitly.
+			pendingSendAttachments = [];
+			const failed: string[] = [];
+			for (const attachment of attachments) {
+				try {
+					await sendAttachment(chatId, attachment);
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					failed.push(`${attachment.path}: ${message}`);
+				}
+			}
+
+			const sentFiles = attachments.length - failed.length;
+			const summary = `Sent ${messages} Telegram message(s) and ${sentFiles} attachment(s) to chat ${chatId}.`;
+			if (failed.length > 0) {
+				throw new Error(`${summary} Failed attachments:\n${failed.join("\n")}`);
+			}
+			return {
+				content: [{ type: "text", text: summary }],
+				details: { chatId, messages, attachments: attachments.map((attachment) => attachment.path) },
 			};
 		},
 	});
@@ -1236,6 +1319,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async (_event, _ctx) => {
 		queuedTelegramTurns = [];
+		pendingSendAttachments = [];
 		dialogAlerts.clear();
 		for (const state of mediaGroups.values()) {
 			if (state.flushTimer) clearTimeout(state.flushTimer);

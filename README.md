@@ -104,6 +104,8 @@ The extension:
 
 If you ask pi for a file or generated artifact, pi should call the `telegram_attach` tool. The extension then sends those files with the next Telegram reply.
 
+When a turn did not come from Telegram (for example a notice from another pi session), pi can still reach you with the `telegram_send` tool. It sends text (split into 4096-character chunks like normal replies) and optional files to the paired chat. Files queued with `telegram_attach` outside a Telegram turn go out with the next `telegram_send`. If the bridge is not connected, the tool fails with an explicit error instead of dropping the message.
+
 Examples:
 - `summarize this image`
 - `read this README and summarize it`
@@ -142,6 +144,7 @@ It tries Telegram draft streaming first with `sendMessageDraft`. If that is not 
 - Replies are sent as normal Telegram messages, not quote-replies
 - Long replies are split below Telegram's 4096 character limit
 - Outbound files are sent via `telegram_attach`
+- Proactive messages outside a Telegram turn are sent via `telegram_send`
 
 ## License
 
