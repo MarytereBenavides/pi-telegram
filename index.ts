@@ -507,13 +507,14 @@ export default function (pi: ExtensionAPI) {
 		return state.messageId !== undefined;
 	}
 
-	async function sendTextReply(chatId: number, _replyToMessageId: number, text: string): Promise<number | undefined> {
+	async function sendTextReply(chatId: number, replyToMessageId: number, text: string): Promise<number | undefined> {
 		const chunks = chunkParagraphs(text);
 		let lastMessageId: number | undefined;
-		for (const chunk of chunks) {
+		for (const [index, chunk] of chunks.entries()) {
 			const sent = await callTelegram<TelegramSentMessage>("sendMessage", {
 				chat_id: chatId,
 				text: chunk,
+				...(index === 0 ? { reply_parameters: { message_id: replyToMessageId, allow_sending_without_reply: true } } : {}),
 			});
 			lastMessageId = sent.message_id;
 		}
