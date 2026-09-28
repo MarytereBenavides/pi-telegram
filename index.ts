@@ -1105,7 +1105,17 @@ export default function (pi: ExtensionAPI) {
 	pi.on("message_start", async (event, _ctx) => {
 		if (!activeTelegramTurn || !isAssistantMessage(event.message)) return;
 		if (previewState && (previewState.pendingText.trim().length > 0 || previewState.lastSentText.trim().length > 0)) {
-			await finalizePreview(activeTelegramTurn.chatId);
+			// Carry the same Telegram message across every assistant text segment of this turn
+			// (tool calls open new segments) instead of finalizing/sending a new message per segment.
+			await flushPreview(activeTelegramTurn.chatId);
+			previewState = {
+				mode: previewState.mode,
+				messageId: previewState.messageId,
+				replyToMessageId: activeTelegramTurn.replyToMessageId,
+				pendingText: "",
+				lastSentText: previewState.lastSentText,
+			};
+			return;
 		}
 		previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", replyToMessageId: activeTelegramTurn.replyToMessageId, pendingText: "", lastSentText: "" };
 	});
