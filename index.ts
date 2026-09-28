@@ -153,6 +153,28 @@ interface TelegramMediaGroupState {
 	flushTimer?: ReturnType<typeof setTimeout>;
 }
 
+/** One blocking terminal dialog that has been announced to Telegram. */
+interface DialogAlert {
+	chatId: number;
+	messageId?: number;
+	lines: string[];
+	sending: Promise<void>;
+}
+
+/** One option of a `gentle-pi` choice/questionnaire tool call. */
+interface DialogOption {
+	label?: unknown;
+	description?: unknown;
+}
+
+/** One question of an `ask_user_question` tool call. */
+interface DialogQuestion {
+	question?: unknown;
+	header?: unknown;
+	options?: unknown;
+	multiSelect?: unknown;
+}
+
 const CONFIG_PATH = join(homedir(), ".pi", "agent", "telegram.json");
 const TEMP_DIR = join(homedir(), ".pi", "agent", "tmp", "telegram");
 const TELEGRAM_PREFIX = "[telegram]";
@@ -161,6 +183,26 @@ const MAX_ATTACHMENTS_PER_TURN = 10;
 const PREVIEW_THROTTLE_MS = 750;
 const TELEGRAM_DRAFT_ID_MAX = 2_147_483_647;
 const TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS = 1200;
+
+/**
+ * Tools that open a blocking terminal dialog and expose the full question and
+ * options through their `tool_call` arguments. Everything else is announced
+ * from the generic `ui_prompt_start` event, which only carries kind and title.
+ */
+const DIALOG_TOOL_NAMES = new Set(["ask_user_choice", "ask_user_question"]);
+
+/** Key used for the single generic UI prompt alert; pi never nests outer prompts. */
+const UI_PROMPT_ALERT_KEY = "ui_prompt";
+
+const DIALOG_ALERT_HEADER = "⏸ pi is waiting for your answer in the terminal";
+
+const DIALOG_RESOLVED_HEADER = "✅ Answered in the terminal";
+
+/**
+ * pi exposes no API to submit an answer to an open dialog from an extension, so
+ * the alert has to say plainly that replying here does not unblock the session.
+ */
+const DIALOG_ALERT_FOOTER = "Answer in the pi terminal. A reply here is queued as a normal message and does not select an option.";
 
 const SYSTEM_PROMPT_SUFFIX = `
 
@@ -301,6 +343,8 @@ export default function (pi: ExtensionAPI) {
 	let draftSupport: "unknown" | "supported" | "unsupported" = "unsupported";
 	let nextDraftId = 0;
 	const mediaGroups = new Map<string, TelegramMediaGroupState>();
+	const dialogAlerts = new Map<string, DialogAlert>();
+	let lastKnownChatId: number | undefined;
 
 	function allocateDraftId(): number {
 		nextDraftId = nextDraftId >= TELEGRAM_DRAFT_ID_MAX ? 1 : nextDraftId + 1;
@@ -591,6 +635,93 @@ export default function (pi: ExtensionAPI) {
 			lastMessageId = sent.message_id;
 		}
 		return lastMessageId;
+	}
+
+	/**
+	 * Chat used for unsolicited alerts. Prefers the chat of the turn in flight,
+	 * then the last chat that talked to the bridge, then the paired account — in
+	 * a private chat the Telegram user id doubles as the chat id.
+	 */
+	function resolveAlertChatId(): number | undefined {
+		return activeTelegramTurn?.chatId ?? lastKnownChatId ?? config.allowedUserId;
+	}
+
+	function formatDialogOptions(options: unknown): string[] {
+		if (!Array.isArray(options)) return [];
+		return options.flatMap((option: DialogOption, index) => {
+			if (typeof option?.label !== "string") return [];
+			const description = typeof option.description === "string" && option.description.length > 0
+				? ` — ${option.description}`
+				: "";
+			return [`${index + 1}. ${option.label}${description}`];
+		});
+	}
+
+	/** Renders the question and numbered options of an `ask_user_choice` call. */
+	function formatChoiceDialog(input: Record<string, unknown>): string[] {
+		if (typeof input.question !== "string") return [];
+		return [input.question, ...formatDialogOptions(input.options)];
+	}
+
+	/** Renders every question and its numbered options of an `ask_user_question` call. */
+	function formatQuestionnaireDialog(input: Record<string, unknown>): string[] {
+		if (!Array.isArray(input.questions)) return [];
+		return input.questions.flatMap((question: DialogQuestion, index, all) => {
+			if (typeof question?.question !== "string") return [];
+			const position = all.length > 1 ? `(${index + 1}/${all.length}) ` : "";
+			const multi = question.multiSelect === true ? " [multiple choice]" : "";
+			return [`${position}${question.question}${multi}`, ...formatDialogOptions(question.options)];
+		});
+	}
+
+	function formatDialogAlert(lines: string[], resolved: boolean): string {
+		const body = resolved
+			? [DIALOG_RESOLVED_HEADER, "", ...lines].join("\n")
+			: [DIALOG_ALERT_HEADER, "", ...lines, "", DIALOG_ALERT_FOOTER].join("\n");
+		return body.length <= MAX_MESSAGE_LENGTH ? body : `${body.slice(0, MAX_MESSAGE_LENGTH - 1)}…`;
+	}
+
+	/**
+	 * Announces a blocking terminal dialog. Alerts are unsolicited (no reply
+	 * target) because the dialog can be opened by a turn that never came from
+	 * Telegram — exactly the case that leaves the session stuck unnoticed.
+	 */
+	function openDialogAlert(key: string, lines: string[]): void {
+		if (!pollingController || dialogAlerts.has(key)) return;
+		const chatId = resolveAlertChatId();
+		if (chatId === undefined) return;
+
+		const alert: DialogAlert = { chatId, lines, sending: Promise.resolve() };
+		alert.sending = (async () => {
+			try {
+				const sent = await callTelegram<TelegramSentMessage>("sendMessage", {
+					chat_id: chatId,
+					text: formatDialogAlert(lines, false),
+				});
+				alert.messageId = sent.message_id;
+			} catch {
+				// Best effort: a failed alert must never break the dialog itself.
+			}
+		})();
+		dialogAlerts.set(key, alert);
+	}
+
+	/** Marks an announced dialog as no longer blocking, editing the original alert in place. */
+	async function closeDialogAlert(key: string): Promise<void> {
+		const alert = dialogAlerts.get(key);
+		if (!alert) return;
+		dialogAlerts.delete(key);
+		await alert.sending;
+		if (alert.messageId === undefined) return;
+		try {
+			await callTelegram("editMessageText", {
+				chat_id: alert.chatId,
+				message_id: alert.messageId,
+				text: formatDialogAlert(alert.lines, true),
+			});
+		} catch {
+			// Best effort: the alert stays as sent if Telegram rejects the edit.
+		}
 	}
 
 	async function sendQueuedAttachments(turn: ActiveTelegramTurn): Promise<void> {
@@ -947,6 +1078,8 @@ export default function (pi: ExtensionAPI) {
 			await sendTextReply(message.chat.id, message.message_id, "Telegram bridge paired with this account.");
 		}
 
+		lastKnownChatId = message.chat.id;
+
 		if (message.from.id !== config.allowedUserId) {
 			await sendTextReply(message.chat.id, message.message_id, "This bot is not authorized for your account.");
 			return;
@@ -1103,6 +1236,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async (_event, _ctx) => {
 		queuedTelegramTurns = [];
+		dialogAlerts.clear();
 		for (const state of mediaGroups.values()) {
 			if (state.flushTimer) clearTimeout(state.flushTimer);
 		}
@@ -1222,5 +1356,38 @@ export default function (pi: ExtensionAPI) {
 	pi.on("agent_settled", async (_event, ctx) => {
 		dispatchNextQueuedTelegramTurn(ctx);
 		stopTypingLoopIfInactive();
+	});
+
+	// A blocking dialog opened by a turn that did not come from Telegram is invisible
+	// to the user until they look at the terminal. `tool_call` is the only event that
+	// carries the question and its options, so the rich alert is built from there.
+	pi.on("tool_call", async (event) => {
+		if (!DIALOG_TOOL_NAMES.has(event.toolName)) return;
+		const input = event.input as Record<string, unknown>;
+		const lines = event.toolName === "ask_user_choice"
+			? formatChoiceDialog(input)
+			: formatQuestionnaireDialog(input);
+		if (lines.length === 0) return;
+		openDialogAlert(event.toolCallId, lines);
+	});
+
+	pi.on("tool_execution_end", async (event) => {
+		if (!DIALOG_TOOL_NAMES.has(event.toolName)) return;
+		await closeDialogAlert(event.toolCallId);
+	});
+
+	// Catch-all for every other blocking prompt (project trust, and any extension
+	// calling ctx.ui.select/confirm/input/editor/custom). The event only carries
+	// kind and optional title, so the alert cannot list options here.
+	pi.on("ui_prompt_start", async (event) => {
+		if (dialogAlerts.size > 0) return;
+		const title = typeof event.title === "string" && event.title.length > 0
+			? event.title
+			: `pi opened a ${event.kind} dialog and is blocked on it.`;
+		openDialogAlert(UI_PROMPT_ALERT_KEY, [title]);
+	});
+
+	pi.on("ui_prompt_end", async () => {
+		await closeDialogAlert(UI_PROMPT_ALERT_KEY);
 	});
 }
