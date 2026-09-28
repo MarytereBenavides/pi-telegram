@@ -145,6 +145,7 @@ interface TelegramPreviewState {
 	pendingText: string;
 	lastSentText: string;
 	flushTimer?: ReturnType<typeof setTimeout>;
+	inFlight?: Promise<void>;
 }
 
 interface TelegramMediaGroupState {
@@ -478,10 +479,47 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	// Installs a fresh preview state, cancelling any timer still armed on the state it
+	// replaces. Without the clearTimeout the orphaned timer fires against the new object.
+	function startPreviewState(replyToMessageId: number): TelegramPreviewState {
+		if (previewState?.flushTimer) {
+			clearTimeout(previewState.flushTimer);
+		}
+		previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", replyToMessageId, pendingText: "", lastSentText: "" };
+		return previewState;
+	}
+
 	async function flushPreview(chatId: number): Promise<void> {
 		const state = previewState;
 		if (!state) return;
-		state.flushTimer = undefined;
+		if (state.flushTimer) {
+			clearTimeout(state.flushTimer);
+			state.flushTimer = undefined;
+		}
+
+		// Serialize the round-trips of a single preview state. A sendMessage slower than
+		// PREVIEW_THROTTLE_MS would otherwise let the next scheduled flush run while
+		// state.messageId is still unset, sending a duplicate message instead of editing
+		// the first one. Each caller awaits the whole chain, so finalizePreview still sees
+		// the settled state.
+		const previous = state.inFlight;
+		const current = (async () => {
+			if (previous) await previous.catch(() => {});
+			await sendPreviewText(chatId, state);
+		})();
+		state.inFlight = current;
+		try {
+			await current;
+		} finally {
+			if (state.inFlight === current) {
+				state.inFlight = undefined;
+			}
+		}
+	}
+
+	async function sendPreviewText(chatId: number, state: TelegramPreviewState): Promise<void> {
+		// The state may have been cleared or replaced while this link of the chain waited.
+		if (previewState !== state) return;
 		const text = state.pendingText.trim();
 		if (!text || text === state.lastSentText) return;
 		const truncated = text.length > MAX_MESSAGE_LENGTH ? text.slice(0, MAX_MESSAGE_LENGTH) : text;
@@ -1095,7 +1133,7 @@ export default function (pi: ExtensionAPI) {
 			const nextTurn = queuedTelegramTurns.shift();
 			if (nextTurn) {
 				activeTelegramTurn = { ...nextTurn };
-				previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", replyToMessageId: nextTurn.replyToMessageId, pendingText: "", lastSentText: "" };
+				startPreviewState(nextTurn.replyToMessageId);
 				startTypingLoop(ctx);
 			}
 		}
@@ -1108,6 +1146,9 @@ export default function (pi: ExtensionAPI) {
 			// Carry the same Telegram message across every assistant text segment of this turn
 			// (tool calls open new segments) instead of finalizing/sending a new message per segment.
 			await flushPreview(activeTelegramTurn.chatId);
+			if (previewState?.flushTimer) {
+				clearTimeout(previewState.flushTimer);
+			}
 			previewState = {
 				mode: previewState.mode,
 				messageId: previewState.messageId,
@@ -1117,15 +1158,13 @@ export default function (pi: ExtensionAPI) {
 			};
 			return;
 		}
-		previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", replyToMessageId: activeTelegramTurn.replyToMessageId, pendingText: "", lastSentText: "" };
+		startPreviewState(activeTelegramTurn.replyToMessageId);
 	});
 
 	pi.on("message_update", async (event, _ctx) => {
 		if (!activeTelegramTurn || !isAssistantMessage(event.message)) return;
-		if (!previewState) {
-			previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", replyToMessageId: activeTelegramTurn.replyToMessageId, pendingText: "", lastSentText: "" };
-		}
-		previewState.pendingText = getMessageText(event.message);
+		const state = previewState ?? startPreviewState(activeTelegramTurn.replyToMessageId);
+		state.pendingText = getMessageText(event.message);
 		schedulePreviewFlush(activeTelegramTurn.chatId);
 	});
 
@@ -1169,6 +1208,18 @@ export default function (pi: ExtensionAPI) {
 
 		await sendQueuedAttachments(turn);
 
+		// Best effort only: pi still reports the run as active during agent_end, so the
+		// isIdle() guard in dispatchNextQueuedTelegramTurn rejects this call. The queue is
+		// actually drained from agent_settled below.
+		dispatchNextQueuedTelegramTurn(ctx);
+		stopTypingLoopIfInactive();
+	});
+
+	// pi clears its run flag at the start of agent_settled and only then emits it, so this
+	// is the first point where ctx.isIdle() is true after a turn. Dispatching only from
+	// agent_end left every turn queued during a busy run waiting for the next incoming
+	// Telegram message to trigger a dispatch, which answered each message one message late.
+	pi.on("agent_settled", async (_event, ctx) => {
 		dispatchNextQueuedTelegramTurn(ctx);
 		stopTypingLoopIfInactive();
 	});
