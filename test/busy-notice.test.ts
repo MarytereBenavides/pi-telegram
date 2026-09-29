@@ -18,6 +18,8 @@ let calls: ApiCall[];
 let pendingUpdates: any[];
 let sendMessageFails: boolean;
 let wakeLongPoll: (() => void) | undefined;
+/** getUpdates call number that first returned each update id. */
+let returnedAtPoll: Map<number, number>;
 const realFetch = globalThis.fetch;
 
 /** Minimal inbound private message from the paired account. */
@@ -91,7 +93,10 @@ function installFetchStub(): void {
 					init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
 				});
 			}
-			return new Response(JSON.stringify({ ok: true, result: pendingUpdates.splice(0) }));
+			const pollNumber = calls.filter((call) => call.method === "getUpdates").length;
+			const result = pendingUpdates.splice(0);
+			for (const update of result) if (!returnedAtPoll.has(update.update_id)) returnedAtPoll.set(update.update_id, pollNumber);
+			return new Response(JSON.stringify({ ok: true, result }));
 		}
 		if (method === "sendMessage" && sendMessageFails) {
 			return new Response(JSON.stringify({ ok: false, description: "Bad Request: chat not found" }));
@@ -120,18 +125,18 @@ async function waitFor(predicate: () => boolean, label: string): Promise<void> {
 
 /** Resolves once pollLoop has consumed the queued batch and gone back to long polling. */
 async function deliver(updates: any[]): Promise<void> {
-	const before = calls.filter((call) => call.method === "getUpdates").length;
 	pendingUpdates.push(...updates);
 	const wake = wakeLongPoll;
 	wakeLongPoll = undefined;
 	wake?.();
-	// pollLoop only reopens getUpdates past the last update_id once the whole
-	// batch went through handleUpdate, so this offset is the completion signal.
+	// pollLoop handles a batch sequentially and only then polls again, so a poll
+	// after the one that returned the batch is the completion signal. The offset
+	// is not: queued turns keep it at the watermark.
 	const lastId = updates[updates.length - 1].update_id;
-	await waitFor(
-		() => calls.some((call) => call.method === "getUpdates" && call.body.offset > lastId),
-		`the batch up to update ${lastId} to be processed (${before} polls before)`,
-	);
+	await waitFor(() => {
+		const returnedAt = returnedAtPoll.get(lastId);
+		return returnedAt !== undefined && calls.filter((call) => call.method === "getUpdates").length > returnedAt;
+	}, `the batch up to update ${lastId} to be processed`);
 }
 
 before(async () => {
@@ -151,6 +156,7 @@ beforeEach(async () => {
 	pendingUpdates = [];
 	sendMessageFails = false;
 	wakeLongPoll = undefined;
+	returnedAtPoll = new Map();
 	installFetchStub();
 	await writeTelegramConfig({ botToken: "123:TEST", allowedUserId: PAIRED_USER_ID, lastUpdateId: 1 });
 });

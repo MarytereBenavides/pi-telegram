@@ -12,7 +12,13 @@ interface TelegramConfig {
 	botUsername?: string;
 	botId?: number;
 	allowedUserId?: number;
+	/**
+	 * Low watermark: every update up to this id is fully processed, so it is
+	 * safe to acknowledge to Telegram. Never advanced past a queued or running turn.
+	 */
 	lastUpdateId?: number;
+	/** Updates above the watermark that already finished; skipped when Telegram redelivers them. */
+	processedUpdateIds?: number[];
 }
 
 interface TelegramApiResponse<T> {
@@ -123,6 +129,8 @@ interface DownloadedTelegramFile {
 }
 
 interface PendingTelegramTurn {
+	/** Telegram updates this turn answers; acknowledged only once the turn ends. */
+	updateIds: number[];
 	chatId: number;
 	replyToMessageId: number;
 	queuedAttachments: QueuedAttachment[];
@@ -150,6 +158,7 @@ interface TelegramPreviewState {
 
 interface TelegramMediaGroupState {
 	messages: TelegramMessage[];
+	updateIds: number[];
 	flushTimer?: ReturnType<typeof setTimeout>;
 }
 
@@ -184,6 +193,13 @@ const MAX_ATTACHMENTS_PER_TURN = 10;
 const PREVIEW_THROTTLE_MS = 750;
 const TELEGRAM_DRAFT_ID_MAX = 2_147_483_647;
 const TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS = 1200;
+/**
+ * getUpdates returns unacknowledged updates immediately, so while turns wait in
+ * the queue every poll hands them back. This pause keeps that from spinning.
+ */
+const KNOWN_UPDATES_REPOLL_MS = 2000;
+/** Telegram's maximum; the batch must fit every retained update plus the new ones. */
+const GET_UPDATES_LIMIT = 100;
 
 /**
  * Tools that open a blocking terminal dialog and expose the full question and
@@ -327,6 +343,16 @@ function chunkParagraphs(text: string): string[] {
 	return chunks;
 }
 
+function abortableDelay(ms: number, signal: AbortSignal): Promise<void> {
+	return new Promise((resolve) => {
+		const timer = setTimeout(resolve, ms);
+		signal.addEventListener("abort", () => {
+			clearTimeout(timer);
+			resolve();
+		}, { once: true });
+	});
+}
+
 async function readConfig(): Promise<TelegramConfig> {
 	try {
 		const content = await readFile(CONFIG_PATH, "utf8");
@@ -395,6 +421,36 @@ export default function (pi: ExtensionAPI) {
 	let busyNoticeSent = false;
 	/** Files queued by telegram_attach outside a Telegram turn; flushed by the next telegram_send. */
 	let pendingSendAttachments: QueuedAttachment[] = [];
+	/** Updates held by a queued, running or debounced turn: they pin the watermark. */
+	const retainedUpdateIds = new Set<number>();
+	/** Highest update id received; the watermark catches up to it once nothing is retained. */
+	let highestSeenUpdateId: number | undefined;
+
+	function isUpdateKnown(updateId: number): boolean {
+		return (config.lastUpdateId !== undefined && updateId <= config.lastUpdateId)
+			|| retainedUpdateIds.has(updateId)
+			|| (config.processedUpdateIds ?? []).includes(updateId);
+	}
+
+	/**
+	 * Marks updates as done and persists the new watermark: everything below the
+	 * oldest retained update, or everything seen when nothing is retained. A
+	 * restart then redelivers exactly the turns that never finished.
+	 */
+	async function completeUpdates(updateIds: number[]): Promise<void> {
+		if (updateIds.length === 0) return;
+		for (const id of updateIds) retainedUpdateIds.delete(id);
+		const processed = new Set([...(config.processedUpdateIds ?? []), ...updateIds]);
+		const oldestRetained = retainedUpdateIds.size > 0 ? Math.min(...retainedUpdateIds) : undefined;
+		const watermark = oldestRetained !== undefined ? oldestRetained - 1 : highestSeenUpdateId;
+		if (watermark !== undefined && (config.lastUpdateId === undefined || watermark > config.lastUpdateId)) {
+			config.lastUpdateId = watermark;
+		}
+		const floor = config.lastUpdateId ?? -Infinity;
+		config.processedUpdateIds = [...processed].filter((id) => id > floor).sort((a, b) => a - b);
+		if (config.processedUpdateIds.length === 0) delete config.processedUpdateIds;
+		await writeConfig(config);
+	}
 
 	function allocateDraftId(): number {
 		nextDraftId = nextDraftId >= TELEGRAM_DRAFT_ID_MAX ? 1 : nextDraftId + 1;
@@ -947,6 +1003,7 @@ export default function (pi: ExtensionAPI) {
 
 	async function createTelegramTurn(
 		messages: TelegramMessage[],
+		updateIds: number[],
 		historyTurns: PendingTelegramTurn[] = [],
 	): Promise<PendingTelegramTurn> {
 		const firstMessage = messages[0];
@@ -988,6 +1045,8 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		return {
+			// Folded history turns are answered here, so their updates ride along.
+			updateIds: [...historyTurns.flatMap((turn) => turn.updateIds), ...updateIds],
 			chatId: firstMessage.chat.id,
 			replyToMessageId: firstMessage.message_id,
 			queuedAttachments: [],
@@ -996,7 +1055,7 @@ export default function (pi: ExtensionAPI) {
 		};
 	}
 
-	async function dispatchAuthorizedTelegramMessages(messages: TelegramMessage[], ctx: ExtensionContext): Promise<void> {
+	async function dispatchAuthorizedTelegramMessages(messages: TelegramMessage[], updateIds: number[], ctx: ExtensionContext): Promise<void> {
 		const firstMessage = messages[0];
 		if (!firstMessage) return;
 		const rawText = messages.map((message) => (message.text || message.caption || "").trim()).find((text) => text.length > 0) || "";
@@ -1097,7 +1156,8 @@ export default function (pi: ExtensionAPI) {
 
 		const historyTurns = preserveQueuedTurnsAsHistory ? queuedTelegramTurns.splice(0) : [];
 		preserveQueuedTurnsAsHistory = false;
-		const turn = await createTelegramTurn(messages, historyTurns);
+		const turn = await createTelegramTurn(messages, updateIds, historyTurns);
+		for (const id of turn.updateIds) retainedUpdateIds.add(id);
 		queuedTelegramTurns.push(turn);
 		dispatchNextQueuedTelegramTurn(ctx);
 
@@ -1131,23 +1191,32 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	async function handleAuthorizedTelegramMessage(message: TelegramMessage, ctx: ExtensionContext): Promise<void> {
+	async function handleAuthorizedTelegramMessage(message: TelegramMessage, updateId: number, ctx: ExtensionContext): Promise<void> {
 		if (message.media_group_id) {
 			const key = `${message.chat.id}:${message.media_group_id}`;
-			const existing = mediaGroups.get(key) ?? { messages: [] };
+			const existing = mediaGroups.get(key) ?? { messages: [], updateIds: [] };
 			existing.messages.push(message);
+			existing.updateIds.push(updateId);
+			// Retained while debounced, so a later update cannot move the watermark past it.
+			retainedUpdateIds.add(updateId);
 			if (existing.flushTimer) clearTimeout(existing.flushTimer);
 			existing.flushTimer = setTimeout(() => {
 				const state = mediaGroups.get(key);
 				mediaGroups.delete(key);
 				if (!state) return;
-				void dispatchAuthorizedTelegramMessages(state.messages, ctx);
+				void dispatchAuthorizedTelegramMessages(state.messages, state.updateIds, ctx)
+					.catch((error) => updateStatus(ctx, error instanceof Error ? error.message : String(error)))
+					.finally(() => {
+						// Handed to a turn: that turn completes them. Otherwise (command or failure) they are done now.
+						const held = [...queuedTelegramTurns, activeTelegramTurn].some((turn) => turn?.updateIds.includes(state.updateIds[0]!));
+						if (!held) void completeUpdates(state.updateIds);
+					});
 			}, TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS);
 			mediaGroups.set(key, existing);
 			return;
 		}
 
-		await dispatchAuthorizedTelegramMessages([message], ctx);
+		await dispatchAuthorizedTelegramMessages([message], [updateId], ctx);
 	}
 
 	async function handleUpdate(update: TelegramUpdate, ctx: ExtensionContext): Promise<void> {
@@ -1168,7 +1237,7 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		await handleAuthorizedTelegramMessage(message, ctx);
+		await handleAuthorizedTelegramMessage(message, update.update_id, ctx);
 	}
 
 	async function pollLoop(ctx: ExtensionContext, signal: AbortSignal): Promise<void> {
@@ -1201,21 +1270,32 @@ export default function (pi: ExtensionAPI) {
 				// The write above yields, so the bridge may have been disconnected meanwhile:
 				// re-check before opening a 30 s poll with an already aborted signal.
 				if (signal.aborted) return;
+				// A getUpdates offset acknowledges everything below it, so it must never
+				// pass the watermark: queued turns stay with Telegram until they finish.
 				const updates = await callTelegram<TelegramUpdate[]>(
 					"getUpdates",
 					{
 						offset: config.lastUpdateId !== undefined ? config.lastUpdateId + 1 : undefined,
-						limit: 10,
+						limit: GET_UPDATES_LIMIT,
 						timeout: 30,
 						allowed_updates: ["message", "edited_message"],
 					},
 					{ signal },
 				);
+				let receivedNew = false;
 				for (const update of updates) {
-					config.lastUpdateId = update.update_id;
-					await writeConfig(config);
-					await handleUpdate(update, ctx);
+					const id = update.update_id;
+					if (highestSeenUpdateId === undefined || id > highestSeenUpdateId) highestSeenUpdateId = id;
+					if (isUpdateKnown(id)) continue;
+					receivedNew = true;
+					try {
+						await handleUpdate(update, ctx);
+					} finally {
+						// Commands, rejections and failures finish here; turns finish in agent_end.
+						if (!retainedUpdateIds.has(id)) await completeUpdates([id]);
+					}
 				}
+				if (updates.length > 0 && !receivedNew) await abortableDelay(KNOWN_UPDATES_REPOLL_MS, signal);
 			} catch (error) {
 				if (signal.aborted) return;
 				if (error instanceof DOMException && error.name === "AbortError") return;
@@ -1401,7 +1481,11 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (_event, _ctx) => {
+		// Unfinished turns are dropped here on purpose: their updates were never
+		// acknowledged, so the next session receives them again from Telegram.
 		queuedTelegramTurns = [];
+		retainedUpdateIds.clear();
+		highestSeenUpdateId = undefined;
 		pendingSendAttachments = [];
 		dialogAlerts.clear();
 		for (const state of mediaGroups.values()) {
@@ -1477,7 +1561,15 @@ export default function (pi: ExtensionAPI) {
 		activeTelegramTurn = undefined;
 		updateStatus(ctx);
 		if (!turn) return;
+		try {
+			await deliverTurnResult(turn, event, ctx);
+		} finally {
+			// Any ending (answered, failed or aborted by "stop") settles the turn for good.
+			await completeUpdates(turn.updateIds);
+		}
+	});
 
+	async function deliverTurnResult(turn: ActiveTelegramTurn, event: { messages: AgentMessage[] }, ctx: ExtensionContext): Promise<void> {
 		const assistant = extractAssistantText(event.messages);
 		if (assistant.stopReason === "aborted") {
 			await clearPreview(turn.chatId);
@@ -1516,7 +1608,7 @@ export default function (pi: ExtensionAPI) {
 		dispatchNextQueuedTelegramTurn(ctx);
 		stopTypingLoopIfInactive();
 		resetBusyNoticeIfDrained();
-	});
+	}
 
 	// pi clears its run flag at the start of agent_settled and only then emits it, so this
 	// is the first point where ctx.isIdle() is true after a turn. Dispatching only from
