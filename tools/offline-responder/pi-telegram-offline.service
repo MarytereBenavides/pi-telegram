@@ -1,0 +1,21 @@
+[Unit]
+Description=pi-telegram offline responder (answers Telegram while no pi session is polling)
+Documentation=file:%h/.pi/agent/git/github.com/MarytereBenavides/pi-telegram/tools/offline-responder/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=PI_TELEGRAM_OFFLINE_FOREGROUND=1
+ExecStart=%h/.pi/agent/git/github.com/MarytereBenavides/pi-telegram/tools/offline-responder/offline-responder start
+Restart=always
+RestartSec=10
+# The responder only reads ~/.pi/agent and writes its own cache directory.
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.cache/pi-telegram-offline
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

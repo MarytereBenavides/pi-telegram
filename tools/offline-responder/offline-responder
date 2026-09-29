@@ -1,0 +1,404 @@
+#!/usr/bin/env python3
+"""offline-responder — responde por Telegram cuando ninguna sesion de pi esta escuchando.
+
+Solo avisa. Nunca confirma un mensaje contra Telegram: llama a getUpdates con el
+mismo offset que usaria pi, asi los mensajes siguen en la cola y pi los recibe
+cuando vuelve a encenderse.
+
+Uso: offline-responder start|stop|status|once
+"""
+
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+
+# --- Constantes ------------------------------------------------------------
+HOME = os.path.expanduser("~")
+CACHE_DIR = os.environ.get("PI_TELEGRAM_OFFLINE_CACHE", os.path.join(HOME, ".cache", "pi-telegram-offline"))
+STATE_FILE = os.path.join(CACHE_DIR, "state.json")
+PID_FILE = os.path.join(CACHE_DIR, "pid")
+LOG_FILE = os.path.join(CACHE_DIR, "log")
+
+TELEGRAM_CONFIG = os.path.join(HOME, ".pi", "agent", "telegram.json")
+HEARTBEAT_FILE = os.path.join(HOME, ".pi", "agent", "telegram-heartbeat.json")
+
+API_BASE = os.environ.get("PI_TELEGRAM_OFFLINE_API", "https://api.telegram.org").rstrip("/")
+INTERVAL = int(os.environ.get("PI_TELEGRAM_OFFLINE_INTERVAL", "20"))
+# El long poll de pi dura 30 s: se toleran dos ciclos antes de darlo por apagado.
+HEARTBEAT_MAX_AGE = int(os.environ.get("PI_TELEGRAM_OFFLINE_HEARTBEAT_MAX_AGE", "90"))
+MAX_LOG_BYTES = 1024 * 1024
+# Cuantos update_id respondidos se recuerdan; alcanza y sobra para no repetir.
+MAX_REMEMBERED = 500
+
+OFFLINE_TEXT = (
+    "El Chief est\u00e1 apagado en este momento. Tu mensaje qued\u00f3 guardado y lo va a leer "
+    "apenas vuelva a encenderse."
+)
+
+
+# --- Utilidades ------------------------------------------------------------
+def ensure_cache_dir():
+    os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
+
+
+def rotate_log():
+    try:
+        if os.path.getsize(LOG_FILE) > MAX_LOG_BYTES:
+            os.replace(LOG_FILE, LOG_FILE + ".1")
+    except OSError:
+        pass
+
+
+def log(message):
+    ensure_cache_dir()
+    rotate_log()
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    line = "%s  %s\n" % (stamp, message)
+    with open(LOG_FILE, "a", encoding="utf-8") as handle:
+        handle.write(line)
+    if os.environ.get("PI_TELEGRAM_OFFLINE_ECHO") == "1":
+        sys.stdout.write(line)
+        sys.stdout.flush()
+
+
+def load_state():
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as handle:
+            state = json.load(handle)
+    except (OSError, ValueError):
+        return {"answered": []}
+    if not isinstance(state, dict) or not isinstance(state.get("answered"), list):
+        return {"answered": []}
+    return state
+
+
+def save_state(state):
+    ensure_cache_dir()
+    state["answered"] = state.get("answered", [])[-MAX_REMEMBERED:]
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(state, handle, ensure_ascii=False, indent=1)
+    os.replace(tmp, STATE_FILE)
+
+
+def read_json(path):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+# --- Latido ----------------------------------------------------------------
+def pi_is_listening():
+    """True si alguna sesion de pi escribio el latido hace poco."""
+    marker = read_json(HEARTBEAT_FILE)
+    if not marker:
+        return False
+    updated_at = marker.get("updatedAt")
+    if not isinstance(updated_at, (int, float)):
+        return False
+    age = time.time() - (updated_at / 1000.0)
+    # Un latido del futuro (reloj movido) se trata como fresco: preferimos
+    # callarnos antes que competir con pi por getUpdates y provocar un 409.
+    return age < HEARTBEAT_MAX_AGE
+
+
+# --- Telegram --------------------------------------------------------------
+def telegram_config():
+    config = read_json(TELEGRAM_CONFIG)
+    if not config:
+        log("ERROR no se pudo leer %s" % TELEGRAM_CONFIG)
+        return None
+    if not config.get("botToken") or not config.get("allowedUserId"):
+        log("ERROR la configuracion de Telegram no tiene botToken o allowedUserId")
+        return None
+    return config
+
+
+def curl_quote(value):
+    out = value.replace("\\", "\\\\").replace('"', '\\"')
+    return out.replace("\n", "\\n").replace("\t", "\\t").replace("\r", "")
+
+
+def call_telegram(token, method, params):
+    """Llama a la Bot API. El token viaja por stdin: nunca en argv ni en el log.
+
+    Devuelve (codigo_http, cuerpo_decodificado_o_None).
+    """
+    lines = ['url = "%s/bot%s/%s"' % (API_BASE, curl_quote(token), method)]
+    for key, value in params.items():
+        lines.append('data-urlencode = "%s=%s"' % (key, curl_quote(str(value))))
+    lines += ["silent", "show-error", 'write-out = "\\n%{http_code}"', ""]
+    try:
+        proc = subprocess.run(
+            ["curl", "--config", "-"],
+            input="\n".join(lines).encode("utf-8"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        log("ERROR curl fallo en %s: %s" % (method, type(exc).__name__))
+        return None, None
+    raw = proc.stdout.decode("utf-8", "replace")
+    body, _, code = raw.rpartition("\n")
+    code = code.strip()
+    try:
+        parsed = json.loads(body) if body.strip() else None
+    except ValueError:
+        parsed = None
+    return (int(code) if code.isdigit() else None), parsed
+
+
+def fetch_pending_updates(token, last_update_id):
+    """Lee los mensajes en cola SIN confirmarlos.
+
+    Telegram solo confirma un update cuando se pide un offset mayor a su
+    update_id. Se usa exactamente el mismo offset con el que pi reanuda el
+    polling (lastUpdateId + 1), asi que esta llamada no consume nada.
+    """
+    params = {"timeout": 0, "limit": 10, "allowed_updates": json.dumps(["message", "edited_message"])}
+    if isinstance(last_update_id, int):
+        params["offset"] = last_update_id + 1
+    code, payload = call_telegram(token, "getUpdates", params)
+    if code == 409:
+        # pi volvio y tomo el long poll: no es un error, se espera la proxima pasada.
+        log("409: pi esta usando getUpdates, se deja pasar")
+        return None
+    if code != 200 or not payload or not payload.get("ok"):
+        log("ERROR getUpdates respondio HTTP %s" % (code or "sin codigo"))
+        return None
+    result = payload.get("result")
+    return result if isinstance(result, list) else []
+
+
+def send_offline_reply(token, chat_id, reply_to_message_id):
+    params = {
+        "chat_id": chat_id,
+        "text": OFFLINE_TEXT,
+        "disable_web_page_preview": "true",
+        "reply_parameters": json.dumps({"message_id": reply_to_message_id, "allow_sending_without_reply": True}),
+    }
+    code, _ = call_telegram(token, "sendMessage", params)
+    if code == 200:
+        log("aviso de apagado enviado a %s (respuesta a %s)" % (chat_id, reply_to_message_id))
+        return True
+    log("ERROR sendMessage respondio HTTP %s" % (code or "sin codigo"))
+    return False
+
+
+# --- Pasada ----------------------------------------------------------------
+def new_messages(updates, allowed_user_id, answered):
+    """Mensajes del usuario habilitado que todavia no fueron respondidos."""
+    found = []
+    for update in updates:
+        if not isinstance(update, dict):
+            continue
+        update_id = update.get("update_id")
+        if not isinstance(update_id, int) or update_id in answered:
+            continue
+        message = update.get("message") or update.get("edited_message")
+        if not isinstance(message, dict):
+            continue
+        sender = message.get("from") or {}
+        if sender.get("id") != allowed_user_id:
+            continue
+        chat = message.get("chat") or {}
+        if chat.get("type") != "private":
+            continue
+        found.append((update_id, chat.get("id"), message.get("message_id")))
+    return found
+
+
+def one_pass():
+    if pi_is_listening():
+        log("latido fresco: pi esta escuchando, no se llama a Telegram")
+        return 0
+
+    config = telegram_config()
+    if not config:
+        return 0
+
+    updates = fetch_pending_updates(config["botToken"], config.get("lastUpdateId"))
+    if updates is None:
+        return 0
+
+    state = load_state()
+    answered = set(state.get("answered", []))
+    pending = new_messages(updates, config["allowedUserId"], answered)
+    if not pending:
+        log("sin mensajes nuevos que responder")
+        return 0
+
+    # Una sola respuesta por tanda, encadenada al primer mensaje sin responder.
+    first_update_id, chat_id, message_id = pending[0]
+    sent = send_offline_reply(config["botToken"], chat_id, message_id)
+    if not sent:
+        # No se marca nada: la proxima pasada reintenta.
+        return 0
+
+    state["answered"] = state.get("answered", []) + [update_id for update_id, _, _ in pending]
+    state["last_notified_at"] = int(time.time())
+    save_state(state)
+    log("tanda de %d mensaje(s) respondida (desde update %d)" % (len(pending), first_update_id))
+    return 1
+
+
+# --- Demonio ---------------------------------------------------------------
+def read_pid():
+    try:
+        with open(PID_FILE, "r", encoding="utf-8") as handle:
+            return int(handle.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def pid_alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def run_forever():
+    running = {"flag": True}
+
+    def on_term(_signum, _frame):
+        running["flag"] = False
+
+    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGINT, on_term)
+
+    log("INICIO pid=%d intervalo=%ds latido_max=%ds" % (os.getpid(), INTERVAL, HEARTBEAT_MAX_AGE))
+    while running["flag"]:
+        try:
+            one_pass()
+        except Exception as exc:  # una pasada rota no mata al vigilante
+            log("ERROR en la pasada: %s: %s" % (type(exc).__name__, exc))
+        for _ in range(INTERVAL):
+            if not running["flag"]:
+                break
+            time.sleep(1)
+    log("FIN pid=%d" % os.getpid())
+
+
+def cmd_start():
+    # Bajo systemd el proceso corre en primer plano, sin pid file propio.
+    if os.environ.get("PI_TELEGRAM_OFFLINE_FOREGROUND") == "1":
+        run_forever()
+        return 0
+
+    pid = read_pid()
+    if pid_alive(pid):
+        print("offline-responder ya esta corriendo (pid %d)" % pid)
+        return 0
+
+    ensure_cache_dir()
+    try:
+        os.remove(PID_FILE)
+    except OSError:
+        pass
+
+    if os.fork() > 0:
+        for _ in range(30):
+            time.sleep(0.2)
+            new_pid = read_pid()
+            if pid_alive(new_pid):
+                print("offline-responder arrancado (pid %d), log en %s" % (new_pid, LOG_FILE))
+                return 0
+        print("offline-responder no arranco; revisa %s" % LOG_FILE)
+        return 1
+
+    os.setsid()
+    if os.fork() > 0:
+        os._exit(0)
+
+    with open(os.devnull, "r") as devnull:
+        os.dup2(devnull.fileno(), 0)
+    with open(LOG_FILE, "a") as logfile:
+        os.dup2(logfile.fileno(), 1)
+        os.dup2(logfile.fileno(), 2)
+
+    with open(PID_FILE, "w", encoding="utf-8") as handle:
+        handle.write(str(os.getpid()))
+
+    run_forever()
+    try:
+        os.remove(PID_FILE)
+    except OSError:
+        pass
+    os._exit(0)
+
+
+def cmd_stop():
+    pid = read_pid()
+    if not pid_alive(pid):
+        print("offline-responder no esta corriendo")
+        try:
+            os.remove(PID_FILE)
+        except OSError:
+            pass
+        return 0
+    os.kill(pid, signal.SIGTERM)
+    for _ in range(50):
+        if not pid_alive(pid):
+            print("offline-responder detenido (pid %d)" % pid)
+            return 0
+        time.sleep(0.2)
+    print("offline-responder no respondio al SIGTERM (pid %d)" % pid)
+    return 1
+
+
+def cmd_status():
+    pid = read_pid()
+    if pid_alive(pid):
+        print("offline-responder corriendo (pid %d), intervalo %ds" % (pid, INTERVAL))
+    else:
+        print("offline-responder detenido")
+    marker = read_json(HEARTBEAT_FILE)
+    if pi_is_listening():
+        print("pi: escuchando (latido pid %s)" % (marker or {}).get("pid"))
+    elif marker:
+        age = int(time.time() - marker.get("updatedAt", 0) / 1000.0)
+        print("pi: sin responder (latido de hace %ds, limite %ds)" % (age, HEARTBEAT_MAX_AGE))
+    else:
+        print("pi: apagado (no hay latido en %s)" % HEARTBEAT_FILE)
+    state = load_state()
+    print("mensajes ya respondidos: %d" % len(state.get("answered", [])))
+    print("log: %s" % LOG_FILE)
+    return 0 if pid_alive(pid) else 1
+
+
+def cmd_once():
+    sent = one_pass()
+    print("pasada terminada: %d aviso(s) enviado(s)" % sent)
+    print("log: %s" % LOG_FILE)
+    return 0
+
+
+USAGE = "uso: offline-responder start|stop|status|once"
+
+
+def main(argv):
+    if len(argv) != 2:
+        print(USAGE, file=sys.stderr)
+        return 2
+    commands = {"start": cmd_start, "stop": cmd_stop, "status": cmd_status, "once": cmd_once}
+    handler = commands.get(argv[1])
+    if not handler:
+        print(USAGE, file=sys.stderr)
+        return 2
+    ensure_cache_dir()
+    return handler()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

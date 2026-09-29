@@ -1,4 +1,4 @@
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
 import { homedir } from "node:os";
 
@@ -176,6 +176,7 @@ interface DialogQuestion {
 }
 
 const CONFIG_PATH = join(homedir(), ".pi", "agent", "telegram.json");
+const HEARTBEAT_PATH = join(homedir(), ".pi", "agent", "telegram-heartbeat.json");
 const TEMP_DIR = join(homedir(), ".pi", "agent", "tmp", "telegram");
 const TELEGRAM_PREFIX = "[telegram]";
 const MAX_MESSAGE_LENGTH = 4096;
@@ -193,6 +194,14 @@ const DIALOG_TOOL_NAMES = new Set(["ask_user_choice", "ask_user_question"]);
 
 /** Key used for the single generic UI prompt alert; pi never nests outer prompts. */
 const UI_PROMPT_ALERT_KEY = "ui_prompt";
+
+/**
+ * Sent once per busy period so an incoming message is never silently queued.
+ * User-facing copy is Spanish on purpose: the only paired account is the CEO.
+ */
+function formatBusyNotice(queuePosition: number): string {
+	return `Estoy terminando otra tarea. Tu mensaje llegó y queda en fila (n.º ${queuePosition}); te respondo apenas termine.`;
+}
 
 const DIALOG_ALERT_HEADER = "⏸ pi is waiting for your answer in the terminal";
 
@@ -329,6 +338,38 @@ async function writeConfig(config: TelegramConfig): Promise<void> {
 	await writeFile(CONFIG_PATH, JSON.stringify(config, null, "\t") + "\n", "utf8");
 }
 
+/**
+ * Liveness marker for out-of-process watchers (see tools/offline-responder):
+ * its absence or staleness means no pi session is polling the bot, so an
+ * external responder can safely answer without racing pi for getUpdates.
+ * Only the session running pollLoop writes it, and pollLoop only runs in the
+ * one session that connected the bridge.
+ */
+async function writeHeartbeat(): Promise<void> {
+	try {
+		await mkdir(join(homedir(), ".pi", "agent"), { recursive: true });
+		await writeFile(HEARTBEAT_PATH, JSON.stringify({ pid: process.pid, updatedAt: Date.now() }) + "\n", "utf8");
+	} catch {
+		// Best effort: a failed heartbeat must never break polling.
+	}
+}
+
+/** Removes the heartbeat, but only when this process is still its owner. */
+async function removeHeartbeat(): Promise<void> {
+	try {
+		const content = await readFile(HEARTBEAT_PATH, "utf8");
+		const parsed = JSON.parse(content) as { pid?: number };
+		if (parsed.pid !== undefined && parsed.pid !== process.pid) return;
+	} catch {
+		// Unreadable or missing: fall through, the unlink below is guarded too.
+	}
+	try {
+		await unlink(HEARTBEAT_PATH);
+	} catch {
+		// Already gone.
+	}
+}
+
 export default function (pi: ExtensionAPI) {
 	let config: TelegramConfig = {};
 	let pollingController: AbortController | undefined;
@@ -346,6 +387,8 @@ export default function (pi: ExtensionAPI) {
 	const mediaGroups = new Map<string, TelegramMediaGroupState>();
 	const dialogAlerts = new Map<string, DialogAlert>();
 	let lastKnownChatId: number | undefined;
+	/** True once the current busy period was announced; reset when the queue drains. */
+	let busyNoticeSent = false;
 	/** Files queued by telegram_attach outside a Telegram turn; flushed by the next telegram_send. */
 	let pendingSendAttachments: QueuedAttachment[] = [];
 
@@ -1053,6 +1096,35 @@ export default function (pi: ExtensionAPI) {
 		const turn = await createTelegramTurn(messages, historyTurns);
 		queuedTelegramTurns.push(turn);
 		dispatchNextQueuedTelegramTurn(ctx);
+
+		// Only announce when this message is really waiting. A turn handed to pi is
+		// at the head of the queue with a request already in flight; anything else
+		// sits behind a busy run and the sender deserves to know.
+		const startedNow = telegramTurnRequested && queuedTelegramTurns[0] === turn;
+		if (startedNow) return;
+		await announceBusy(firstMessage, queuedTelegramTurns.indexOf(turn) + 1, ctx);
+	}
+
+	/**
+	 * At most one notice per busy period. A failed send is reported and leaves the
+	 * flag down (the next message retries), but never affects the queued turn.
+	 */
+	async function announceBusy(message: TelegramMessage, queuePosition: number, ctx: ExtensionContext): Promise<void> {
+		if (busyNoticeSent) return;
+		try {
+			await sendTextReply(message.chat.id, message.message_id, formatBusyNotice(queuePosition));
+			busyNoticeSent = true;
+		} catch (error) {
+			const reason = error instanceof Error ? error.message : String(error);
+			updateStatus(ctx, `busy notice failed: ${reason}`);
+		}
+	}
+
+	/** A drained queue ends the busy period, so the next one is announced again. */
+	function resetBusyNoticeIfDrained(): void {
+		if (!activeTelegramTurn && queuedTelegramTurns.length === 0) {
+			busyNoticeSent = false;
+		}
 	}
 
 	async function handleAuthorizedTelegramMessage(message: TelegramMessage, ctx: ExtensionContext): Promise<void> {
@@ -1119,6 +1191,12 @@ export default function (pi: ExtensionAPI) {
 
 		while (!signal.aborted) {
 			try {
+				// Refreshed before every long poll (30 s), so a watcher can treat a
+				// marker older than a couple of poll cycles as "pi is not listening".
+				await writeHeartbeat();
+				// The write above yields, so the bridge may have been disconnected meanwhile:
+				// re-check before opening a 30 s poll with an already aborted signal.
+				if (signal.aborted) return;
 				const updates = await callTelegram<TelegramUpdate[]>(
 					"getUpdates",
 					{
@@ -1148,9 +1226,10 @@ export default function (pi: ExtensionAPI) {
 	async function startPolling(ctx: ExtensionContext): Promise<void> {
 		if (!config.botToken || pollingPromise) return;
 		pollingController = new AbortController();
-		pollingPromise = pollLoop(ctx, pollingController.signal).finally(() => {
+		pollingPromise = pollLoop(ctx, pollingController.signal).finally(async () => {
 			pollingPromise = undefined;
 			pollingController = undefined;
+			await removeHeartbeat();
 			updateStatus(ctx);
 		});
 		updateStatus(ctx);
@@ -1332,6 +1411,7 @@ export default function (pi: ExtensionAPI) {
 		telegramTurnRequested = false;
 		currentAbort = undefined;
 		preserveQueuedTurnsAsHistory = false;
+		busyNoticeSent = false;
 		await stopPolling();
 	});
 
@@ -1431,6 +1511,7 @@ export default function (pi: ExtensionAPI) {
 		// actually drained from agent_settled below.
 		dispatchNextQueuedTelegramTurn(ctx);
 		stopTypingLoopIfInactive();
+		resetBusyNoticeIfDrained();
 	});
 
 	// pi clears its run flag at the start of agent_settled and only then emits it, so this
@@ -1440,6 +1521,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("agent_settled", async (_event, ctx) => {
 		dispatchNextQueuedTelegramTurn(ctx);
 		stopTypingLoopIfInactive();
+		resetBusyNoticeIfDrained();
 	});
 
 	// A blocking dialog opened by a turn that did not come from Telegram is invisible

@@ -132,6 +132,24 @@ That aborts the active pi turn.
 
 If you send more Telegram messages while pi is busy, they are queued and processed in order.
 
+The first message that has to wait gets an immediate acknowledgement with its place
+in the queue, so a busy session never looks like a dead one. Only one such notice is
+sent per busy period, no matter how many messages pile up, and the notice is skipped
+entirely when the message is dispatched right away or when it is a command that
+already answers (`stop`, `/compact`, `/status`, `/help`).
+
+### Know when pi is not listening
+
+While the bridge is polling, it refreshes `~/.pi/agent/telegram-heartbeat.json` with
+`{pid, updatedAt}` before every `getUpdates` call, and removes it on disconnect or
+shutdown. Only the one session running the poll loop writes it.
+
+That marker lets an out-of-process watcher tell "pi is busy" from "pi is off" without
+racing the bridge for `getUpdates`. `tools/offline-responder` is such a watcher: it
+answers Telegram while no session is polling, and never confirms an update, so pi
+still receives every message when it comes back. See
+[`tools/offline-responder/README.md`](tools/offline-responder/README.md).
+
 ## Streaming
 
 The extension streams assistant text previews back to Telegram while pi is generating.
@@ -141,6 +159,7 @@ It tries Telegram draft streaming first with `sendMessageDraft`. If that is not 
 ## Notes
 
 - Only one pi session should be connected to the bot at a time
+- The polling session owns `~/.pi/agent/telegram-heartbeat.json`; it is removed on disconnect
 - Replies are sent as normal Telegram messages, not quote-replies
 - Long replies are split below Telegram's 4096 character limit
 - Outbound files are sent via `telegram_attach`

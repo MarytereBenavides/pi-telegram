@@ -22,6 +22,7 @@
   },
   "scripts": {
     "test": "node --test test/*.test.ts",
+    "test:offline-responder": "python3 tools/offline-responder/test_offline_responder.py",
     "typecheck": "npx -y -p typescript@5 tsc -p ."
   },
   "pi": {
