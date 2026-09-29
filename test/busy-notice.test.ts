@@ -34,6 +34,16 @@ function textUpdate(updateId: number, text: string) {
 	};
 }
 
+/**
+ * One member of a media group. Captions only, no `photo`/`document`: the point
+ * here is the debounced grouping into a single turn, not the file download path.
+ */
+function mediaGroupUpdate(updateId: number, groupId: string, caption: string) {
+	const { message, ...rest } = textUpdate(updateId, "");
+	const { text, ...withoutText } = message;
+	return { ...rest, message: { ...withoutText, media_group_id: groupId, caption } };
+}
+
 function createHarness(options: { idle: boolean }) {
 	const commands = new Map<string, { handler: Handler }>();
 	const events = new Map<string, Handler[]>();
@@ -98,6 +108,7 @@ async function writeTelegramConfig(config: Record<string, unknown>): Promise<voi
 const sentMessages = () => calls.filter((call) => call.method === "sendMessage");
 /** Notice attempts: the stub records the call before deciding whether it fails. */
 const busyNotices = () => sentMessages().filter((call) => String(call.body.text).includes("queda en fila"));
+const noticeTexts = () => busyNotices().map((call) => String(call.body.text));
 
 async function waitFor(predicate: () => boolean, label: string): Promise<void> {
 	for (let attempt = 0; attempt < 200; attempt++) {
@@ -151,18 +162,39 @@ describe("busy notice", () => {
 		await harness.emit("session_shutdown");
 	});
 
-	it("announces once for a whole busy period, no matter how many messages arrive", async () => {
+	it("answers every queued message with its position, long first and short after", async () => {
 		harness = createHarness({ idle: false });
 		await harness.emit("session_start");
 		await harness.command("telegram-connect");
 
-		await deliver([textUpdate(2, "primera"), textUpdate(3, "segunda")]);
+		await deliver([textUpdate(2, "primera"), textUpdate(3, "segunda"), textUpdate(4, "tercera")]);
 
 		const notices = busyNotices();
-		assert.equal(notices.length, 1);
-		assert.equal(notices[0]!.body.chat_id, PAIRED_USER_ID);
+		assert.equal(notices.length, 3);
+		assert.deepEqual(notices.map((call) => call.body.chat_id), [PAIRED_USER_ID, PAIRED_USER_ID, PAIRED_USER_ID]);
 		assert.match(notices[0]!.body.text, /Estoy terminando otra tarea\..*\(n\.º 1\)/);
-		assert.equal(notices[0]!.body.reply_parameters.message_id, 20);
+		assert.equal(notices[1]!.body.text, "Recibido, queda en fila (n.º 2).");
+		assert.equal(notices[2]!.body.text, "Recibido, queda en fila (n.º 3).");
+		// Each notice replies to its own message, not to the first one of the period.
+		assert.deepEqual(notices.map((call) => call.body.reply_parameters.message_id), [20, 30, 40]);
+	});
+
+	it("sends one notice per queued turn, not one per photo of a media group", async () => {
+		harness = createHarness({ idle: false });
+		await harness.emit("session_start");
+		await harness.command("telegram-connect");
+
+		await deliver([
+			mediaGroupUpdate(2, "grupo-1", "foto uno"),
+			mediaGroupUpdate(3, "grupo-1", "foto dos"),
+			mediaGroupUpdate(4, "grupo-1", "foto tres"),
+		]);
+		// The group is debounced, so its single turn lands after the poll returns.
+		await waitFor(() => busyNotices().length > 0, "the media group notice");
+		await new Promise((resolve) => setTimeout(resolve, 200));
+
+		assert.deepEqual(noticeTexts().length, 1);
+		assert.match(busyNotices()[0]!.body.text, /Estoy terminando otra tarea\..*\(n\.º 1\)/);
 	});
 
 	it("announces again after the queue drains and the session gets busy once more", async () => {
@@ -183,6 +215,8 @@ describe("busy notice", () => {
 		harness.state.idle = false;
 		await deliver([textUpdate(3, "segunda")]);
 		assert.equal(busyNotices().length, 2);
+		// A new busy period starts over: long copy and position 1 again.
+		assert.match(busyNotices()[1]!.body.text, /Estoy terminando otra tarea\..*\(n\.º 1\)/);
 	});
 
 	it("stays silent when the message is dispatched immediately", async () => {
@@ -218,9 +252,10 @@ describe("busy notice", () => {
 		assert.equal(busyNotices().length, 1);
 		assert.equal(harness.sentUserMessages.length, 0);
 
-		// A failed notice does not consume the once-per-period budget: it retries.
+		// A failed notice leaves the period unopened: the next one still explains.
 		await deliver([textUpdate(3, "segunda")]);
 		assert.equal(busyNotices().length, 2);
+		assert.match(busyNotices()[1]!.body.text, /Estoy terminando otra tarea\..*\(n\.º 2\)/);
 
 		// The turns survived the failed notices and are dispatched once pi goes idle.
 		harness.state.idle = true;

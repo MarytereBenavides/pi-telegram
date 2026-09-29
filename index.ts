@@ -196,11 +196,15 @@ const DIALOG_TOOL_NAMES = new Set(["ask_user_choice", "ask_user_question"]);
 const UI_PROMPT_ALERT_KEY = "ui_prompt";
 
 /**
- * Sent once per busy period so an incoming message is never silently queued.
+ * Sent for every queued message so none is ever silently parked. The first one
+ * of a busy period explains the situation; the rest only confirm the position,
+ * because repeating the explanation on every message is noise.
  * User-facing copy is Spanish on purpose: the only paired account is the CEO.
  */
-function formatBusyNotice(queuePosition: number): string {
-	return `Estoy terminando otra tarea. Tu mensaje llegó y queda en fila (n.º ${queuePosition}); te respondo apenas termine.`;
+function formatBusyNotice(queuePosition: number, isFirstOfPeriod: boolean): string {
+	return isFirstOfPeriod
+		? `Estoy terminando otra tarea. Tu mensaje llegó y queda en fila (n.º ${queuePosition}); te respondo apenas termine.`
+		: `Recibido, queda en fila (n.º ${queuePosition}).`;
 }
 
 const DIALOG_ALERT_HEADER = "⏸ pi is waiting for your answer in the terminal";
@@ -387,7 +391,7 @@ export default function (pi: ExtensionAPI) {
 	const mediaGroups = new Map<string, TelegramMediaGroupState>();
 	const dialogAlerts = new Map<string, DialogAlert>();
 	let lastKnownChatId: number | undefined;
-	/** True once the current busy period was announced; reset when the queue drains. */
+	/** True once the long notice of the current busy period went out; reset when the queue drains. */
 	let busyNoticeSent = false;
 	/** Files queued by telegram_attach outside a Telegram turn; flushed by the next telegram_send. */
 	let pendingSendAttachments: QueuedAttachment[] = [];
@@ -1106,13 +1110,13 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	/**
-	 * At most one notice per busy period. A failed send is reported and leaves the
-	 * flag down (the next message retries), but never affects the queued turn.
+	 * One notice per queued turn (not per photo: a media group is a single turn).
+	 * A failed send is reported and leaves the flag down, so the next message
+	 * still gets the long explanation, but never affects the queued turn.
 	 */
 	async function announceBusy(message: TelegramMessage, queuePosition: number, ctx: ExtensionContext): Promise<void> {
-		if (busyNoticeSent) return;
 		try {
-			await sendTextReply(message.chat.id, message.message_id, formatBusyNotice(queuePosition));
+			await sendTextReply(message.chat.id, message.message_id, formatBusyNotice(queuePosition, !busyNoticeSent));
 			busyNoticeSent = true;
 		} catch (error) {
 			const reason = error instanceof Error ? error.message : String(error);
@@ -1120,7 +1124,7 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	/** A drained queue ends the busy period, so the next one is announced again. */
+	/** A drained queue ends the busy period, so the next one opens with the long notice again. */
 	function resetBusyNoticeIfDrained(): void {
 		if (!activeTelegramTurn && queuedTelegramTurns.length === 0) {
 			busyNoticeSent = false;
