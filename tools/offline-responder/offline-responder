@@ -23,6 +23,7 @@ PID_FILE = os.path.join(CACHE_DIR, "pid")
 LOG_FILE = os.path.join(CACHE_DIR, "log")
 
 TELEGRAM_CONFIG = os.path.join(HOME, ".pi", "agent", "telegram.json")
+TELEGRAM_CONFIG_BACKUP = TELEGRAM_CONFIG + ".bak"
 HEARTBEAT_FILE = os.path.join(HOME, ".pi", "agent", "telegram-heartbeat.json")
 
 API_BASE = os.environ.get("PI_TELEGRAM_OFFLINE_API", "https://api.telegram.org").rstrip("/")
@@ -112,8 +113,13 @@ def pi_is_listening():
 def telegram_config():
     config = read_json(TELEGRAM_CONFIG)
     if not config:
-        log("ERROR no se pudo leer %s" % TELEGRAM_CONFIG)
-        return None
+        # pi escribe una copia buena en cada guardado. Aca solo se lee: restaurar el
+        # principal es trabajo de pi, asi hay un unico escritor de telegram.json.
+        config = read_json(TELEGRAM_CONFIG_BACKUP)
+        if not config:
+            log("ERROR no se pudo leer %s ni %s" % (TELEGRAM_CONFIG, TELEGRAM_CONFIG_BACKUP))
+            return None
+        log("AVISO %s ilegible; uso la copia %s" % (TELEGRAM_CONFIG, TELEGRAM_CONFIG_BACKUP))
     if not config.get("botToken") or not config.get("allowedUserId"):
         log("ERROR la configuracion de Telegram no tiene botToken o allowedUserId")
         return None

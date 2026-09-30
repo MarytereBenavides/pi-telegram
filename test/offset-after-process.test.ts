@@ -21,6 +21,8 @@ let wakeLongPoll: (() => void) | undefined;
 /** getUpdates call number (across sessions) that first returned each update id in the current session. */
 let returnedAtPoll: Map<number, number>;
 const realFetch = globalThis.fetch;
+/** How many of the next sendMessage calls Telegram rejects (for example a 429). */
+let failingSendMessages = 0;
 
 function textUpdate(updateId: number, text: string) {
 	return {
@@ -94,6 +96,10 @@ function installFetchStub(): void {
 			for (const update of result) if (!returnedAtPoll.has(update.update_id)) returnedAtPoll.set(update.update_id, pollNumber);
 			return new Response(JSON.stringify({ ok: true, result }));
 		}
+		if (method === "sendMessage" && failingSendMessages > 0) {
+			failingSendMessages--;
+			return new Response(JSON.stringify({ ok: false, error_code: 429, description: "Too Many Requests" }));
+		}
 		return new Response(JSON.stringify({ ok: true, result: { message_id: nextMessageId++ } }));
 	}) as typeof fetch;
 }
@@ -106,8 +112,8 @@ const getUpdatesCalls = () => calls.slice(sessionStart).filter((call) => call.me
 const replies = () => calls.filter((call) => call.method === "sendMessage").map((call) => String(call.body.text));
 const promptText = (content: any) => String(content[0].text);
 
-async function waitFor(predicate: () => boolean, label: string): Promise<void> {
-	for (let attempt = 0; attempt < 200; attempt++) {
+async function waitFor(predicate: () => boolean, label: string, attempts = 200): Promise<void> {
+	for (let attempt = 0; attempt < attempts; attempt++) {
 		if (predicate()) return;
 		await new Promise((resolve) => setTimeout(resolve, 10));
 	}
@@ -158,6 +164,7 @@ after(async () => {
 
 beforeEach(async () => {
 	calls = [];
+	failingSendMessages = 0;
 	sessionStart = 0;
 	serverUpdates = [];
 	returnedAtPoll = new Map();
@@ -307,6 +314,29 @@ describe("offset committed after processing", () => {
 		const config = await readConfig();
 		assert.equal(config.lastUpdateId, 2);
 		assert.equal(config.startedUpdateIds, undefined);
+	});
+
+	it("retries the interruption notice instead of acknowledging the message when the notice fails", async () => {
+		harness = createHarness({ idle: true });
+		await harness.emit("session_start");
+		await harness.command("telegram-connect");
+
+		await deliver([textUpdate(2, "reiniciate")]);
+		await harness.emit("agent_start");
+		failingSendMessages = 1;
+		harness = await restart(harness, { idle: true });
+		const notice = 'Tu mensaje "reiniciate" se interrumpió por un reinicio; no lo repetí. Reenvíalo si hace falta.';
+		// The first notice fails; the update stays with Telegram and comes back after the 3 s back-off.
+		await waitFor(() => replies().filter((text) => text === notice).length === 2, "the notice to be retried", 600);
+		// Acknowledged once the retried notice went out.
+		let config = await readConfig();
+		for (let attempt = 0; attempt < 200 && config.lastUpdateId !== 2; attempt++) {
+			await new Promise((resolve) => setTimeout(resolve, 10));
+			config = await readConfig();
+		}
+		assert.equal(config.lastUpdateId, 2);
+		assert.equal(config.startedUpdateIds, undefined);
+		assert.equal(harness.sentUserMessages.length, 0, "the interrupted message must never run");
 	});
 
 	it("still redelivers a queued turn that had not started when pi stopped", async () => {

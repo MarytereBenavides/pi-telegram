@@ -217,5 +217,30 @@ class OfflineResponderTest(unittest.TestCase):
         self.assertEqual(self.server.calls_to("sendMessage"), [])
 
 
+    def test_damaged_config_falls_back_to_the_backup_without_touching_it(self):
+        self.write_heartbeat(age_seconds=600)
+        damaged = '{"botToken": "123:TEST", "allowedUs'
+        with open(self.telegram_config + ".bak", "w", encoding="utf-8") as handle:
+            json.dump({"botToken": "123:TEST", "allowedUserId": PAIRED_USER_ID, "lastUpdateId": LAST_UPDATE_ID}, handle)
+        with open(self.telegram_config, "w", encoding="utf-8") as handle:
+            handle.write(damaged)
+        self.server.updates = [text_update(LAST_UPDATE_ID + 1, "hola")]
+
+        self.run_once()
+
+        self.assertEqual(len(self.server.calls_to("sendMessage")), 1)
+        with open(self.telegram_config, "r", encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), damaged, "restaurar es trabajo de pi, no del responder")
+
+    def test_damaged_config_without_backup_does_nothing_and_does_not_crash(self):
+        self.write_heartbeat(age_seconds=600)
+        with open(self.telegram_config, "w", encoding="utf-8") as handle:
+            handle.write('{"botToken": "123:TE')
+        self.server.updates = [text_update(LAST_UPDATE_ID + 1, "hola")]
+
+        self.run_once()
+
+        self.assertEqual(self.server.calls, [])
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

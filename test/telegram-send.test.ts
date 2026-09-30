@@ -126,7 +126,13 @@ describe("telegram_send", () => {
 		}
 	});
 
-	it("fails explicitly and sends nothing when the bridge is not connected", async () => {
+	it("fails explicitly and sends nothing when the bridge is not connected", async (t) => {
+		// session_start autoconnects when this is set, as in the Chief's own environment.
+		const autoconnect = process.env.PI_TELEGRAM_AUTOCONNECT;
+		delete process.env.PI_TELEGRAM_AUTOCONNECT;
+		t.after(() => {
+			if (autoconnect !== undefined) process.env.PI_TELEGRAM_AUTOCONNECT = autoconnect;
+		});
 		harness = createHarness();
 		await harness.emit("session_start");
 

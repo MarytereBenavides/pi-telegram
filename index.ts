@@ -1,4 +1,4 @@
-import { mkdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
 import { homedir } from "node:os";
 
@@ -191,6 +191,10 @@ interface DialogQuestion {
 }
 
 const CONFIG_PATH = join(homedir(), ".pi", "agent", "telegram.json");
+/** Last config that was written successfully; the source for restoring a damaged CONFIG_PATH. */
+const CONFIG_BACKUP_PATH = `${CONFIG_PATH}.bak`;
+/** The config holds the bot token: every copy of it is readable by its owner only. */
+const CONFIG_FILE_MODE = 0o600;
 const HEARTBEAT_PATH = join(homedir(), ".pi", "agent", "telegram-heartbeat.json");
 const TEMP_DIR = join(homedir(), ".pi", "agent", "tmp", "telegram");
 const TELEGRAM_PREFIX = "[telegram]";
@@ -368,19 +372,112 @@ function abortableDelay(ms: number, signal: AbortSignal): Promise<void> {
 	});
 }
 
-async function readConfig(): Promise<TelegramConfig> {
+interface LoadedConfig {
+	config: TelegramConfig;
+	/** CONFIG_PATH was damaged and has been restored from the backup written at this time. */
+	restoredFrom?: Date;
+	/** CONFIG_PATH is damaged and there is no usable backup: the bridge must stay down. */
+	error?: string;
+}
+
+/** Set while CONFIG_PATH is damaged and unrecoverable, so no write replaces the only copy left. */
+let configWritesBlocked = false;
+
+function isMissingFile(error: unknown): boolean {
+	return (error as NodeJS.ErrnoException | undefined)?.code === "ENOENT";
+}
+
+async function readConfigFile(path: string): Promise<{ config?: TelegramConfig; missing?: true; error?: string }> {
+	let content: string;
 	try {
-		const content = await readFile(CONFIG_PATH, "utf8");
-		const parsed = JSON.parse(content) as TelegramConfig;
-		return parsed;
-	} catch {
-		return {};
+		content = await readFile(path, "utf8");
+	} catch (error) {
+		if (isMissingFile(error)) return { missing: true };
+		return { error: error instanceof Error ? error.message : String(error) };
+	}
+	try {
+		const parsed: unknown = JSON.parse(content);
+		if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return { error: "not a JSON object" };
+		return { config: parsed as TelegramConfig };
+	} catch (error) {
+		return { error: error instanceof Error ? error.message : String(error) };
 	}
 }
 
-async function writeConfig(config: TelegramConfig): Promise<void> {
-	await mkdir(join(homedir(), ".pi", "agent"), { recursive: true });
-	await writeFile(CONFIG_PATH, JSON.stringify(config, null, "\t") + "\n", "utf8");
+/** Writes through a temporary file in the same directory, so readers see the old or the new file, never a mix. */
+async function writeFileAtomic(path: string, content: string): Promise<void> {
+	const temporary = `${path}.${process.pid}.tmp`;
+	await writeFile(temporary, content, { encoding: "utf8", mode: CONFIG_FILE_MODE });
+	await rename(temporary, path);
+}
+
+/**
+ * Reads CONFIG_PATH. A missing file is a fresh install. A damaged one is kept aside as
+ * telegram.json.corrupt-<timestamp> and replaced by the backup, so the bridge stays up;
+ * without a usable backup it is left untouched and further writes are blocked.
+ */
+export async function readConfig(): Promise<LoadedConfig> {
+	configWritesBlocked = false;
+	const main = await readConfigFile(CONFIG_PATH);
+	if (main.config) return { config: main.config };
+	if (main.missing) return { config: {} };
+
+	console.error(`pi-telegram: ${CONFIG_PATH} is damaged (${main.error})`);
+	const backup = await readConfigFile(CONFIG_BACKUP_PATH);
+	if (!backup.config) {
+		configWritesBlocked = true;
+		const error = `${CONFIG_PATH} is damaged and ${CONFIG_BACKUP_PATH} is ${backup.missing ? "missing" : "damaged too"}; run /telegram-setup`;
+		console.error(`pi-telegram: ${error}`);
+		return { config: {}, error };
+	}
+
+	const backupStats = await stat(CONFIG_BACKUP_PATH);
+	const corruptPath = `${CONFIG_PATH}.corrupt-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+	await rename(CONFIG_PATH, corruptPath);
+	await chmod(corruptPath, CONFIG_FILE_MODE);
+	await writeFileAtomic(CONFIG_PATH, JSON.stringify(backup.config, null, "\t") + "\n");
+	console.error(`pi-telegram: restored ${CONFIG_PATH} from ${CONFIG_BACKUP_PATH}; the damaged file is ${corruptPath}`);
+	return { config: backup.config, restoredFrom: backupStats.mtime };
+}
+
+/**
+ * Every writer (poll loop, album timers, pi events) shares this chain: one write at a
+ * time, each with the content of the config when it was requested.
+ */
+let configWriteChain: Promise<void> = Promise.resolve();
+
+export async function writeConfig(config: TelegramConfig): Promise<void> {
+	const content = JSON.stringify(config, null, "\t") + "\n";
+	const write = configWriteChain.then(async () => {
+		if (configWritesBlocked) {
+			console.error(`pi-telegram: not writing ${CONFIG_PATH}, it is damaged and has no backup; run /telegram-setup`);
+			return;
+		}
+		await mkdir(join(homedir(), ".pi", "agent"), { recursive: true });
+		await writeFileAtomic(CONFIG_PATH, content);
+		await writeFileAtomic(CONFIG_BACKUP_PATH, content);
+	});
+	configWriteChain = write.catch(() => undefined);
+	await write;
+}
+
+/** An explicit /telegram-setup replaces a damaged config; the damaged file is kept aside. */
+async function unblockConfigWrites(): Promise<void> {
+	if (!configWritesBlocked) return;
+	const corruptPath = `${CONFIG_PATH}.corrupt-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+	try {
+		await rename(CONFIG_PATH, corruptPath);
+		await chmod(corruptPath, CONFIG_FILE_MODE);
+	} catch (error) {
+		if (!isMissingFile(error)) throw error;
+	}
+	configWritesBlocked = false;
+}
+
+function formatConfigRestoredNotice(restoredFrom: Date): string {
+	const pad = (value: number) => String(value).padStart(2, "0");
+	const when = `${pad(restoredFrom.getDate())}/${pad(restoredFrom.getMonth() + 1)} ${pad(restoredFrom.getHours())}:${pad(restoredFrom.getMinutes())}`;
+	return `telegram.json estaba dañado; lo restauré desde la copia de ${when}.`;
 }
 
 /**
@@ -427,6 +524,10 @@ export default function (pi: ExtensionAPI) {
 	let preserveQueuedTurnsAsHistory = false;
 	let setupInProgress = false;
 	let previewState: TelegramPreviewState | undefined;
+	/** Why the config could not be loaded; shown in the status line until /telegram-setup fixes it. */
+	let configError: string | undefined;
+	/** Backup time of a config restored at load, announced on Telegram once connected. */
+	let pendingRestoreNotice: Date | undefined;
 	/** The latest assistant message of the active turn already reached Telegram from message_end. */
 	let latestAnswerDelivered = false;
 	let draftSupport: "unknown" | "supported" | "unsupported" = "unsupported";
@@ -444,10 +545,12 @@ export default function (pi: ExtensionAPI) {
 	let highestSeenUpdateId: number | undefined;
 	/** Media groups already told they were interrupted, so a redelivered album gets one notice. */
 	const interruptedGroupsNotified = new Set<string>();
+	/** Interrupted updates whose notice failed: retained, yet handled again when redelivered. */
+	const interruptedNoticeRetries = new Set<number>();
 
 	function isUpdateKnown(updateId: number): boolean {
 		return (config.lastUpdateId !== undefined && updateId <= config.lastUpdateId)
-			|| retainedUpdateIds.has(updateId)
+			|| (retainedUpdateIds.has(updateId) && !interruptedNoticeRetries.has(updateId))
 			|| (config.processedUpdateIds ?? []).includes(updateId);
 	}
 
@@ -788,6 +891,26 @@ export default function (pi: ExtensionAPI) {
 	 * then the last chat that talked to the bridge, then the paired account — in
 	 * a private chat the Telegram user id doubles as the chat id.
 	 */
+	async function loadConfig(): Promise<void> {
+		const loaded = await readConfig();
+		config = loaded.config;
+		configError = loaded.error;
+		if (loaded.restoredFrom) pendingRestoreNotice = loaded.restoredFrom;
+	}
+
+	/** Tells the Telegram user their config was restored, once the bridge can reach them. */
+	async function sendPendingRestoreNotice(signal: AbortSignal): Promise<void> {
+		const restoredFrom = pendingRestoreNotice;
+		const chatId = resolveAlertChatId();
+		if (!restoredFrom || chatId === undefined) return;
+		try {
+			await callTelegram("sendMessage", { chat_id: chatId, text: formatConfigRestoredNotice(restoredFrom) }, { signal });
+			pendingRestoreNotice = undefined;
+		} catch {
+			// Best effort: retried on the next connection.
+		}
+	}
+
 	function resolveAlertChatId(): number | undefined {
 		return activeTelegramTurn?.chatId ?? lastKnownChatId ?? config.allowedUserId;
 	}
@@ -1012,6 +1135,8 @@ export default function (pi: ExtensionAPI) {
 			nextConfig.botId = data.result.id;
 			nextConfig.botUsername = data.result.username;
 			config = nextConfig;
+			await unblockConfigWrites();
+			configError = undefined;
 			await writeConfig(config);
 			ctx.ui.notify(`Telegram bot connected: @${config.botUsername ?? "unknown"}`, "info");
 			ctx.ui.notify("Send /start to your bot in Telegram to pair this extension with your account.", "info");
@@ -1282,8 +1407,18 @@ export default function (pi: ExtensionAPI) {
 		if ((config.startedUpdateIds ?? []).includes(update.update_id)) {
 			const groupKey = message.media_group_id ? `${message.chat.id}:${message.media_group_id}` : undefined;
 			if (groupKey && interruptedGroupsNotified.has(groupKey)) return;
+			try {
+				await sendTextReply(message.chat.id, message.message_id, formatInterruptedNotice(message.text || message.caption || ""));
+			} catch (error) {
+				// Without the notice the user would never learn the message was dropped: keep it
+				// unacknowledged so the redelivery comes back here (still not run) and retries.
+				retainedUpdateIds.add(update.update_id);
+				interruptedNoticeRetries.add(update.update_id);
+				throw error;
+			}
 			if (groupKey) interruptedGroupsNotified.add(groupKey);
-			await sendTextReply(message.chat.id, message.message_id, formatInterruptedNotice(message.text || message.caption || ""));
+			retainedUpdateIds.delete(update.update_id);
+			interruptedNoticeRetries.delete(update.update_id);
 			return;
 		}
 
@@ -1298,6 +1433,7 @@ export default function (pi: ExtensionAPI) {
 		} catch {
 			// ignore
 		}
+		await sendPendingRestoreNotice(signal);
 
 		if (config.lastUpdateId === undefined) {
 			try {
@@ -1503,7 +1639,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("telegram-connect", {
 		description: "Start the Telegram bridge in this pi session",
 		handler: async (_args, ctx) => {
-			config = await readConfig();
+			await loadConfig();
 			if (!config.botToken) {
 				await promptForConfig(ctx);
 				return;
@@ -1522,12 +1658,12 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
-		config = await readConfig();
+		await loadConfig();
 		await mkdir(TEMP_DIR, { recursive: true });
 		if (process.env.PI_TELEGRAM_AUTOCONNECT === "1" && config.botToken) {
 			await startPolling(ctx);
 		}
-		updateStatus(ctx);
+		updateStatus(ctx, configError);
 	});
 
 	pi.on("session_shutdown", async (_event, _ctx) => {
@@ -1543,6 +1679,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		mediaGroups.clear();
 		interruptedGroupsNotified.clear();
+		interruptedNoticeRetries.clear();
 		if (activeTelegramTurn) {
 			await clearPreview(activeTelegramTurn.chatId);
 		}
