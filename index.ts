@@ -1486,8 +1486,10 @@ export default function (pi: ExtensionAPI) {
 		// pollLoop acknowledges it right after this return. One notice per media group.
 		if ((config.startedUpdateIds ?? []).includes(update.update_id)) {
 			const groupKey = message.media_group_id ? `${message.chat.id}:${message.media_group_id}` : undefined;
-			if (groupKey && interruptedGroupsNotified.has(groupKey)) return;
-			if (await sendInterruptedNotice(message, update.update_id, ctx) === "retry") return;
+			// A sibling may have notified the group while this item waited for a retry, so the
+			// skip must release it too: a retained id is never acknowledged and pins the offset.
+			const notified = groupKey !== undefined && interruptedGroupsNotified.has(groupKey);
+			if (!notified && await sendInterruptedNotice(message, update.update_id, ctx) === "retry") return;
 			if (groupKey) interruptedGroupsNotified.add(groupKey);
 			retainedUpdateIds.delete(update.update_id);
 			interruptedNoticeRetryAt.delete(update.update_id);
