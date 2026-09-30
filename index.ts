@@ -412,6 +412,8 @@ export default function (pi: ExtensionAPI) {
 	let preserveQueuedTurnsAsHistory = false;
 	let setupInProgress = false;
 	let previewState: TelegramPreviewState | undefined;
+	/** The latest assistant message of the active turn already reached Telegram from message_end. */
+	let latestAnswerDelivered = false;
 	let draftSupport: "unknown" | "supported" | "unsupported" = "unsupported";
 	let nextDraftId = 0;
 	const mediaGroups = new Map<string, TelegramMediaGroupState>();
@@ -1515,6 +1517,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("agent_start", async (_event, ctx) => {
 		currentAbort = () => ctx.abort();
 		telegramTurnRequested = false;
+		latestAnswerDelivered = false;
 		if (!activeTelegramTurn && queuedTelegramTurns.length > 0) {
 			const nextTurn = queuedTelegramTurns.shift();
 			if (nextTurn) {
@@ -1528,6 +1531,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("message_start", async (event, _ctx) => {
 		if (!activeTelegramTurn || !isAssistantMessage(event.message)) return;
+		latestAnswerDelivered = false;
 		if (previewState && (previewState.pendingText.trim().length > 0 || previewState.lastSentText.trim().length > 0)) {
 			// Carry the same Telegram message across every assistant text segment of this turn
 			// (tool calls open new segments) instead of finalizing/sending a new message per segment.
@@ -1552,6 +1556,28 @@ export default function (pi: ExtensionAPI) {
 		const state = previewState ?? startPreviewState(activeTelegramTurn.replyToMessageId);
 		state.pendingText = getMessageText(event.message);
 		schedulePreviewFlush(activeTelegramTurn.chatId);
+	});
+
+	// An assistant message that ends without a tool call is a complete answer. Follow-up
+	// messages (for example intercom notices) can still extend the same run, and each of
+	// them gets its own answer. Delivering the answer here detaches the preview message, so
+	// the next answer starts a new Telegram message instead of editing this one away.
+	pi.on("message_end", async (event, _ctx) => {
+		const turn = activeTelegramTurn;
+		if (!turn || !isAssistantMessage(event.message)) return;
+		const stopReason = (event.message as unknown as { stopReason?: string }).stopReason;
+		if (stopReason !== "stop" && stopReason !== "length") return;
+		const text = getMessageText(event.message);
+		if (!text) return;
+		if (text.length <= MAX_MESSAGE_LENGTH) {
+			const state = previewState ?? startPreviewState(turn.replyToMessageId);
+			state.pendingText = text;
+			await finalizePreview(turn.chatId);
+		} else {
+			await clearPreview(turn.chatId);
+			await sendTextReply(turn.chatId, turn.replyToMessageId, text);
+		}
+		latestAnswerDelivered = true;
 	});
 
 	pi.on("agent_end", async (event, ctx) => {
@@ -1586,7 +1612,10 @@ export default function (pi: ExtensionAPI) {
 			previewState.pendingText = finalText ?? previewState.pendingText;
 		}
 
-		if (finalText && finalText.length <= MAX_MESSAGE_LENGTH) {
+		if (latestAnswerDelivered) {
+			// message_end already sent the final answer.
+			await clearPreview(turn.chatId);
+		} else if (finalText && finalText.length <= MAX_MESSAGE_LENGTH) {
 			const finalized = await finalizePreview(turn.chatId);
 			if (!finalized && turn.queuedAttachments.length > 0 && !finalText) {
 				await sendTextReply(turn.chatId, turn.replyToMessageId, "Attached requested file(s).");
@@ -1600,6 +1629,7 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 
+		latestAnswerDelivered = false;
 		await sendQueuedAttachments(turn);
 
 		// Best effort only: pi still reports the run as active during agent_end, so the
