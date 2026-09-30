@@ -244,6 +244,99 @@ describe("offset committed after processing", () => {
 		assert.equal((await readConfig()).lastUpdateId, 2);
 	});
 
+	it("acknowledges a turn once its answer is delivered, so a restart inside the run does not replay it", async () => {
+		harness = createHarness({ idle: true });
+		await harness.emit("session_start");
+		await harness.command("telegram-connect");
+
+		await deliver([textUpdate(2, "termina la tarea y reiniciate")]);
+		assert.equal(harness.sentUserMessages.length, 1);
+		await harness.emit("agent_start");
+		const answer = { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Listo, reinicio ahora." }] };
+		await harness.emit("message_start", { message: { ...answer, content: [] } });
+		await harness.emit("message_update", { message: answer });
+		await harness.emit("message_end", { message: answer });
+		assert.ok(replies().includes("Listo, reinicio ahora."));
+
+		// `chief restart` closes the tab before the run reaches agent_end: only session_shutdown runs.
+		harness = await restart(harness, { idle: true });
+		await harness.emit("agent_settled");
+
+		assert.equal((await readConfig()).lastUpdateId, 2);
+		assert.equal(harness.sentUserMessages.length, 0, "the new session must not run the answered message again");
+	});
+
+	it("keeps a turn unacknowledged while its only answer so far is cut short before a tool call", async () => {
+		harness = createHarness({ idle: true });
+		await harness.emit("session_start");
+		await harness.command("telegram-connect");
+
+		await deliver([textUpdate(2, "revisa el repo")]);
+		await harness.emit("agent_start");
+		// Truncated output that still carries a tool call: pi keeps the loop going.
+		const partial = {
+			role: "assistant",
+			stopReason: "length",
+			content: [{ type: "text", text: "Reviso el repo" }, { type: "toolCall", id: "t1", name: "bash", arguments: {} }],
+		};
+		await harness.emit("message_start", { message: { ...partial, content: [] } });
+		await harness.emit("message_update", { message: partial });
+		await harness.emit("message_end", { message: partial });
+
+		assert.equal((await readConfig()).lastUpdateId, 1);
+		assert.ok(!replies().includes("Reviso el repo"), "a truncated tool-call segment is not a final answer");
+	});
+
+	it("does not run a message twice when pi stopped while its turn was running", async () => {
+		harness = createHarness({ idle: true });
+		await harness.emit("session_start");
+		await harness.command("telegram-connect");
+
+		await deliver([textUpdate(2, "reiniciate ya, sin responder antes de hacerlo por favor")]);
+		// The turn starts running and pi is restarted before any answer reaches Telegram.
+		await harness.emit("agent_start");
+		harness = await restart(harness, { idle: true });
+		await waitForBatch(2);
+		await harness.emit("agent_settled");
+
+		assert.equal(harness.sentUserMessages.length, 0, "the interrupted message must not run again");
+		assert.ok(
+			replies().includes('Tu mensaje "reiniciate ya, sin responder antes de hacerlo por favor" se interrumpió por un reinicio; no lo repetí. Reenvíalo si hace falta.'),
+			`expected the interruption notice, got ${JSON.stringify(replies())}`,
+		);
+		const config = await readConfig();
+		assert.equal(config.lastUpdateId, 2);
+		assert.equal(config.startedUpdateIds, undefined);
+	});
+
+	it("still redelivers a queued turn that had not started when pi stopped", async () => {
+		harness = createHarness({ idle: false });
+		await harness.emit("session_start");
+		await harness.command("telegram-connect");
+
+		await deliver([textUpdate(2, "en fila")]);
+		harness = await restart(harness, { idle: true });
+		await waitForBatch(2);
+
+		assert.equal(harness.sentUserMessages.length, 1);
+		assert.match(promptText(harness.sentUserMessages[0]), /en fila/);
+		assert.ok(!replies().some((text) => text.includes("se interrumpió")));
+	});
+
+	it("shortens the quoted message to 60 characters in the interruption notice", async () => {
+		harness = createHarness({ idle: true });
+		await harness.emit("session_start");
+		await harness.command("telegram-connect");
+
+		const long = "a".repeat(59) + "bcdef";
+		await deliver([textUpdate(2, long)]);
+		await harness.emit("agent_start");
+		harness = await restart(harness, { idle: true });
+		await waitForBatch(2);
+
+		assert.ok(replies().includes(`Tu mensaje "${"a".repeat(59)}b…" se interrumpió por un reinicio; no lo repetí. Reenvíalo si hace falta.`), JSON.stringify(replies()));
+	});
+
 	it("acknowledges commands immediately when nothing is queued", async () => {
 		harness = createHarness({ idle: true });
 		await harness.emit("session_start");

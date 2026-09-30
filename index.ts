@@ -19,6 +19,12 @@ interface TelegramConfig {
 	lastUpdateId?: number;
 	/** Updates above the watermark that already finished; skipped when Telegram redelivers them. */
 	processedUpdateIds?: number[];
+	/**
+	 * Updates whose turn started running and has not finished. If pi stops meanwhile, Telegram
+	 * redelivers them; they are acknowledged with a notice instead of being run a second time,
+	 * so a message that restarts pi cannot restart it again in a loop.
+	 */
+	startedUpdateIds?: number[];
 }
 
 interface TelegramApiResponse<T> {
@@ -217,6 +223,15 @@ const UI_PROMPT_ALERT_KEY = "ui_prompt";
  * because repeating the explanation on every message is noise.
  * User-facing copy is Spanish on purpose: the only paired account is the CEO.
  */
+const INTERRUPTED_QUOTE_LENGTH = 60;
+
+function formatInterruptedNotice(messageText: string): string {
+	const text = messageText.trim().replace(/\s+/g, " ");
+	const quote = text.length > INTERRUPTED_QUOTE_LENGTH ? `${text.slice(0, INTERRUPTED_QUOTE_LENGTH)}…` : text;
+	const subject = quote ? `Tu mensaje "${quote}"` : "Tu mensaje";
+	return `${subject} se interrumpió por un reinicio; no lo repetí. Reenvíalo si hace falta.`;
+}
+
 function formatBusyNotice(queuePosition: number, isFirstOfPeriod: boolean): string {
 	return isFirstOfPeriod
 		? `Estoy terminando otra tarea. Tu mensaje llegó y queda en fila (n.º ${queuePosition}); te respondo apenas termine.`
@@ -427,6 +442,8 @@ export default function (pi: ExtensionAPI) {
 	const retainedUpdateIds = new Set<number>();
 	/** Highest update id received; the watermark catches up to it once nothing is retained. */
 	let highestSeenUpdateId: number | undefined;
+	/** Media groups already told they were interrupted, so a redelivered album gets one notice. */
+	const interruptedGroupsNotified = new Set<string>();
 
 	function isUpdateKnown(updateId: number): boolean {
 		return (config.lastUpdateId !== undefined && updateId <= config.lastUpdateId)
@@ -451,6 +468,15 @@ export default function (pi: ExtensionAPI) {
 		const floor = config.lastUpdateId ?? -Infinity;
 		config.processedUpdateIds = [...processed].filter((id) => id > floor).sort((a, b) => a - b);
 		if (config.processedUpdateIds.length === 0) delete config.processedUpdateIds;
+		config.startedUpdateIds = (config.startedUpdateIds ?? []).filter((id) => !updateIds.includes(id));
+		if (config.startedUpdateIds.length === 0) delete config.startedUpdateIds;
+		await writeConfig(config);
+	}
+
+	/** Persists that a turn is running, before pi gets the chance to act on it. */
+	async function markUpdatesStarted(updateIds: number[]): Promise<void> {
+		if (updateIds.length === 0) return;
+		config.startedUpdateIds = [...new Set([...(config.startedUpdateIds ?? []), ...updateIds])].sort((a, b) => a - b);
 		await writeConfig(config);
 	}
 
@@ -600,6 +626,18 @@ export default function (pi: ExtensionAPI) {
 	function isAssistantMessage(message: AgentMessage): boolean {
 		// SAFETY: AgentMessage is a union whose variants do not all declare `role`; every field is re-checked at runtime below.
 		return (message as unknown as { role?: string }).role === "assistant";
+	}
+
+	/**
+	 * A complete answer ends the model's output without asking for a tool. A "length" stop that
+	 * still carries a tool call is not one: pi keeps the loop going and executes that call.
+	 */
+	function isFinalAnswer(message: AgentMessage): boolean {
+		// SAFETY: AgentMessage is a union whose variants do not all declare these fields; each one is re-checked at runtime below.
+		const value = message as unknown as Record<string, unknown>;
+		if (value.stopReason !== "stop" && value.stopReason !== "length") return false;
+		const content = Array.isArray(value.content) ? value.content : [];
+		return !content.some((block) => typeof block === "object" && block !== null && (block as { type?: unknown }).type === "toolCall");
 	}
 
 	function getMessageText(message: AgentMessage): string {
@@ -1239,6 +1277,16 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
+		// Its turn was already running when pi stopped: never run it twice. Not retained, so
+		// pollLoop acknowledges it right after this return. One notice per media group.
+		if ((config.startedUpdateIds ?? []).includes(update.update_id)) {
+			const groupKey = message.media_group_id ? `${message.chat.id}:${message.media_group_id}` : undefined;
+			if (groupKey && interruptedGroupsNotified.has(groupKey)) return;
+			if (groupKey) interruptedGroupsNotified.add(groupKey);
+			await sendTextReply(message.chat.id, message.message_id, formatInterruptedNotice(message.text || message.caption || ""));
+			return;
+		}
+
 		await handleAuthorizedTelegramMessage(message, update.update_id, ctx);
 	}
 
@@ -1494,6 +1542,7 @@ export default function (pi: ExtensionAPI) {
 			if (state.flushTimer) clearTimeout(state.flushTimer);
 		}
 		mediaGroups.clear();
+		interruptedGroupsNotified.clear();
 		if (activeTelegramTurn) {
 			await clearPreview(activeTelegramTurn.chatId);
 		}
@@ -1524,6 +1573,7 @@ export default function (pi: ExtensionAPI) {
 				activeTelegramTurn = { ...nextTurn };
 				startPreviewState(nextTurn.replyToMessageId);
 				startTypingLoop(ctx);
+				await markUpdatesStarted(nextTurn.updateIds);
 			}
 		}
 		updateStatus(ctx);
@@ -1565,8 +1615,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("message_end", async (event, _ctx) => {
 		const turn = activeTelegramTurn;
 		if (!turn || !isAssistantMessage(event.message)) return;
-		const stopReason = (event.message as unknown as { stopReason?: string }).stopReason;
-		if (stopReason !== "stop" && stopReason !== "length") return;
+		if (!isFinalAnswer(event.message)) return;
 		const text = getMessageText(event.message);
 		if (!text) return;
 		if (text.length <= MAX_MESSAGE_LENGTH) {
@@ -1578,6 +1627,11 @@ export default function (pi: ExtensionAPI) {
 			await sendTextReply(turn.chatId, turn.replyToMessageId, text);
 		}
 		latestAnswerDelivered = true;
+		// The user has the answer now, so the update is settled. Waiting for agent_end is
+		// not enough: a run that restarts pi (`chief restart`) never reaches it, and the next
+		// session would receive and run the same message again. completeUpdates is idempotent,
+		// so the second call from agent_end is harmless.
+		await completeUpdates(turn.updateIds);
 	});
 
 	pi.on("agent_end", async (event, ctx) => {
