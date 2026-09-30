@@ -23,6 +23,8 @@ let returnedAtPoll: Map<number, number>;
 const realFetch = globalThis.fetch;
 /** How many of the next sendMessage calls Telegram rejects (for example a 429). */
 let failingSendMessages = 0;
+/** Telegram error code for those rejections: 429 is transient, any other 4xx is permanent. */
+let failingSendErrorCode = 429;
 
 function textUpdate(updateId: number, text: string) {
 	return {
@@ -98,7 +100,7 @@ function installFetchStub(): void {
 		}
 		if (method === "sendMessage" && failingSendMessages > 0) {
 			failingSendMessages--;
-			return new Response(JSON.stringify({ ok: false, error_code: 429, description: "Too Many Requests" }));
+			return new Response(JSON.stringify({ ok: false, error_code: failingSendErrorCode, description: `Error ${failingSendErrorCode}` }));
 		}
 		return new Response(JSON.stringify({ ok: true, result: { message_id: nextMessageId++ } }));
 	}) as typeof fetch;
@@ -165,6 +167,7 @@ after(async () => {
 beforeEach(async () => {
 	calls = [];
 	failingSendMessages = 0;
+	failingSendErrorCode = 429;
 	sessionStart = 0;
 	serverUpdates = [];
 	returnedAtPoll = new Map();
@@ -337,6 +340,73 @@ describe("offset committed after processing", () => {
 		assert.equal(config.lastUpdateId, 2);
 		assert.equal(config.startedUpdateIds, undefined);
 		assert.equal(harness.sentUserMessages.length, 0, "the interrupted message must never run");
+	});
+
+	it("gives up on the interruption notice after 3 attempts without holding back the messages behind it", async () => {
+		harness = createHarness({ idle: true });
+		await harness.emit("session_start");
+		await harness.command("telegram-connect");
+
+		await deliver([textUpdate(2, "reiniciate")]);
+		await harness.emit("agent_start");
+		failingSendMessages = 1_000_000;
+		harness = await restart(harness, { idle: true });
+		await deliver([textUpdate(3, "mensaje nuevo de la CEO")]);
+
+		// The new message is not held back by the failing notice in front of it.
+		assert.equal(harness.sentUserMessages.length, 1);
+		assert.match(promptText(harness.sentUserMessages[0]), /mensaje nuevo de la CEO/);
+		const notices = () => replies().filter((text) => text.includes("se interrumpió")).length;
+		await waitFor(() => notices() === 3, "the third notice attempt", 1000);
+		let config = await readConfig();
+		for (let attempt = 0; attempt < 200 && config.startedUpdateIds !== undefined; attempt++) {
+			await new Promise((resolve) => setTimeout(resolve, 10));
+			config = await readConfig();
+		}
+		// Given up: acknowledged without running, and never tried again.
+		assert.equal(config.startedUpdateIds, undefined);
+		assert.equal(config.interruptedNoticeAttempts, undefined);
+		assert.equal(harness.sentUserMessages.filter((content) => /reiniciate/.test(promptText(content))).length, 0);
+		await new Promise((resolve) => setTimeout(resolve, 3500));
+		assert.equal(notices(), 3);
+		failingSendMessages = 0;
+	});
+
+	it("acknowledges at once when Telegram rejects the interruption notice for good", async () => {
+		harness = createHarness({ idle: true });
+		await harness.emit("session_start");
+		await harness.command("telegram-connect");
+
+		await deliver([textUpdate(2, "reiniciate")]);
+		await harness.emit("agent_start");
+		failingSendMessages = 1_000_000;
+		failingSendErrorCode = 400;
+		harness = await restart(harness, { idle: true });
+		await waitForBatch(2);
+
+		assert.equal(replies().filter((text) => text.includes("se interrumpió")).length, 1);
+		const config = await readConfig();
+		assert.equal(config.lastUpdateId, 2);
+		assert.equal(config.startedUpdateIds, undefined);
+		failingSendMessages = 0;
+	});
+
+	it("never splits an emoji when shortening the quoted message", async () => {
+		harness = createHarness({ idle: true });
+		await harness.emit("session_start");
+		await harness.command("telegram-connect");
+
+		// The emoji is the 60th character, two UTF-16 units at positions 59-60.
+		const text = "a".repeat(59) + "😀" + "zzz";
+		await deliver([textUpdate(2, text)]);
+		await harness.emit("agent_start");
+		harness = await restart(harness, { idle: true });
+		await waitForBatch(2);
+
+		const notice = replies().find((reply) => reply.includes("se interrumpió"));
+		assert.equal(notice, `Tu mensaje "${"a".repeat(59)}😀…" se interrumpió por un reinicio; no lo repetí. Reenvíalo si hace falta.`);
+		// A lone surrogate: a high one not followed by a low one, or a low one not preceded by a high one.
+		assert.doesNotMatch(notice!, /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/, "the notice must not carry a lone surrogate");
 	});
 
 	it("still redelivers a queued turn that had not started when pi stopped", async () => {

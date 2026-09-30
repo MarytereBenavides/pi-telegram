@@ -25,6 +25,8 @@ interface TelegramConfig {
 	 * so a message that restarts pi cannot restart it again in a loop.
 	 */
 	startedUpdateIds?: number[];
+	/** Failed interruption notices per update id, capped at INTERRUPTED_NOTICE_MAX_ATTEMPTS across restarts. */
+	interruptedNoticeAttempts?: Record<string, number>;
 }
 
 interface TelegramApiResponse<T> {
@@ -228,10 +230,31 @@ const UI_PROMPT_ALERT_KEY = "ui_prompt";
  * User-facing copy is Spanish on purpose: the only paired account is the CEO.
  */
 const INTERRUPTED_QUOTE_LENGTH = 60;
+/** Attempts at the interruption notice before the update is acknowledged without it. */
+const INTERRUPTED_NOTICE_MAX_ATTEMPTS = 3;
+const INTERRUPTED_NOTICE_RETRY_MS = 3000;
+
+/** A Bot API error response, with Telegram's error code when it sent one. */
+class TelegramApiError extends Error {
+	readonly errorCode?: number;
+
+	constructor(message: string, errorCode?: number) {
+		super(message);
+		this.errorCode = errorCode;
+	}
+}
+
+/** 4xx other than 429 (rate limit) will fail the same way on every retry. */
+function isPermanentTelegramError(error: unknown): boolean {
+	const code = error instanceof TelegramApiError ? error.errorCode : undefined;
+	return code !== undefined && code >= 400 && code < 500 && code !== 429;
+}
 
 function formatInterruptedNotice(messageText: string): string {
-	const text = messageText.trim().replace(/\s+/g, " ");
-	const quote = text.length > INTERRUPTED_QUOTE_LENGTH ? `${text.slice(0, INTERRUPTED_QUOTE_LENGTH)}…` : text;
+	// Counted in code points: cutting UTF-16 units can split an emoji into a lone surrogate.
+	const characters = Array.from(messageText.trim().replace(/\s+/g, " "));
+	const text = characters.join("");
+	const quote = characters.length > INTERRUPTED_QUOTE_LENGTH ? `${characters.slice(0, INTERRUPTED_QUOTE_LENGTH).join("")}…` : text;
 	const subject = quote ? `Tu mensaje "${quote}"` : "Tu mensaje";
 	return `${subject} se interrumpió por un reinicio; no lo repetí. Reenvíalo si hace falta.`;
 }
@@ -568,12 +591,15 @@ export default function (pi: ExtensionAPI) {
 	let highestSeenUpdateId: number | undefined;
 	/** Media groups already told they were interrupted, so a redelivered album gets one notice. */
 	const interruptedGroupsNotified = new Set<string>();
-	/** Interrupted updates whose notice failed: retained, yet handled again when redelivered. */
-	const interruptedNoticeRetries = new Set<number>();
+	/**
+	 * Interrupted updates whose notice failed, with the time of the next attempt. They stay
+	 * retained, and are handled again once redelivered after that time.
+	 */
+	const interruptedNoticeRetryAt = new Map<number, number>();
 
 	function isUpdateKnown(updateId: number): boolean {
 		return (config.lastUpdateId !== undefined && updateId <= config.lastUpdateId)
-			|| (retainedUpdateIds.has(updateId) && !interruptedNoticeRetries.has(updateId))
+			|| (retainedUpdateIds.has(updateId) && !(Date.now() >= (interruptedNoticeRetryAt.get(updateId) ?? Infinity)))
 			|| (config.processedUpdateIds ?? []).includes(updateId);
 	}
 
@@ -596,6 +622,10 @@ export default function (pi: ExtensionAPI) {
 		if (config.processedUpdateIds.length === 0) delete config.processedUpdateIds;
 		config.startedUpdateIds = (config.startedUpdateIds ?? []).filter((id) => !updateIds.includes(id));
 		if (config.startedUpdateIds.length === 0) delete config.startedUpdateIds;
+		if (config.interruptedNoticeAttempts) {
+			for (const id of updateIds) delete config.interruptedNoticeAttempts[String(id)];
+			if (Object.keys(config.interruptedNoticeAttempts).length === 0) delete config.interruptedNoticeAttempts;
+		}
 		await writeConfig(config);
 	}
 
@@ -652,7 +682,7 @@ export default function (pi: ExtensionAPI) {
 		});
 			const data = (await response.json()) as TelegramApiResponse<TResponse>;
 		if (!data.ok || data.result === undefined) {
-			throw new Error(data.description || `Telegram API ${method} failed`);
+			throw new TelegramApiError(data.description || `Telegram API ${method} failed`, data.error_code);
 		}
 		return data.result;
 	}
@@ -1407,6 +1437,33 @@ export default function (pi: ExtensionAPI) {
 		await dispatchAuthorizedTelegramMessages([message], [updateId], ctx);
 	}
 
+	/**
+	 * Without the notice the user would never learn the message was dropped, so a failed one is
+	 * retried: the update stays unacknowledged and its redelivery comes back here, still not run.
+	 * Failures never throw, so the updates behind it are processed meanwhile. The retries stop
+	 * after INTERRUPTED_NOTICE_MAX_ATTEMPTS, or at once when Telegram rejects the notice for good.
+	 */
+	async function sendInterruptedNotice(message: TelegramMessage, updateId: number, ctx: ExtensionContext): Promise<"done" | "retry"> {
+		try {
+			await sendTextReply(message.chat.id, message.message_id, formatInterruptedNotice(message.text || message.caption || ""));
+			return "done";
+		} catch (error) {
+			const attempts = (config.interruptedNoticeAttempts?.[String(updateId)] ?? 0) + 1;
+			const reason = error instanceof Error ? error.message : String(error);
+			if (!isPermanentTelegramError(error) && attempts < INTERRUPTED_NOTICE_MAX_ATTEMPTS) {
+				config.interruptedNoticeAttempts = { ...config.interruptedNoticeAttempts, [String(updateId)]: attempts };
+				await writeConfig(config);
+				retainedUpdateIds.add(updateId);
+				interruptedNoticeRetryAt.set(updateId, Date.now() + INTERRUPTED_NOTICE_RETRY_MS);
+				return "retry";
+			}
+			const dropped = `interruption notice for update ${updateId} dropped after ${attempts} attempt(s): ${reason}`;
+			console.error(`pi-telegram: ${dropped}`);
+			updateStatus(ctx, dropped);
+			return "done";
+		}
+	}
+
 	async function handleUpdate(update: TelegramUpdate, ctx: ExtensionContext): Promise<void> {
 		const message = update.message || update.edited_message;
 		if (!message || message.chat.type !== "private" || !message.from || message.from.is_bot) return;
@@ -1430,18 +1487,10 @@ export default function (pi: ExtensionAPI) {
 		if ((config.startedUpdateIds ?? []).includes(update.update_id)) {
 			const groupKey = message.media_group_id ? `${message.chat.id}:${message.media_group_id}` : undefined;
 			if (groupKey && interruptedGroupsNotified.has(groupKey)) return;
-			try {
-				await sendTextReply(message.chat.id, message.message_id, formatInterruptedNotice(message.text || message.caption || ""));
-			} catch (error) {
-				// Without the notice the user would never learn the message was dropped: keep it
-				// unacknowledged so the redelivery comes back here (still not run) and retries.
-				retainedUpdateIds.add(update.update_id);
-				interruptedNoticeRetries.add(update.update_id);
-				throw error;
-			}
+			if (await sendInterruptedNotice(message, update.update_id, ctx) === "retry") return;
 			if (groupKey) interruptedGroupsNotified.add(groupKey);
 			retainedUpdateIds.delete(update.update_id);
-			interruptedNoticeRetries.delete(update.update_id);
+			interruptedNoticeRetryAt.delete(update.update_id);
 			return;
 		}
 
@@ -1662,6 +1711,12 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("telegram-connect", {
 		description: "Start the Telegram bridge in this pi session",
 		handler: async (_args, ctx) => {
+			// Already polling (for example autoconnected at session_start): reloading the file here
+			// would replace the in-memory config under the poll loop and undo its latest changes.
+			if (pollingPromise) {
+				updateStatus(ctx, configError);
+				return;
+			}
 			await loadConfig();
 			if (!config.botToken) {
 				await promptForConfig(ctx);
@@ -1702,7 +1757,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		mediaGroups.clear();
 		interruptedGroupsNotified.clear();
-		interruptedNoticeRetries.clear();
+		interruptedNoticeRetryAt.clear();
 		if (activeTelegramTurn) {
 			await clearPreview(activeTelegramTurn.chatId);
 		}
