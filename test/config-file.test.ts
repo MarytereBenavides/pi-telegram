@@ -159,6 +159,44 @@ describe("damaged telegram.json at startup", () => {
 		assert.ok(loggedErrors.some((line) => line.includes("is damaged")), JSON.stringify(loggedErrors));
 	});
 
+	it("never leaves telegram.json missing when the restore fails halfway, and the next start restores it", async () => {
+		await writeFile(backupPath(), JSON.stringify(GOOD_CONFIG), { mode: 0o600 });
+		await writeFile(configPath(), DAMAGED, { mode: 0o600 });
+		// A directory where the temporary file goes makes the restore fail after the damaged copy is saved.
+		const temporary = `${configPath()}.${process.pid}.tmp`;
+		await mkdir(temporary);
+
+		harness = createHarness();
+		await harness.emit("session_start");
+		await harness.emit("session_shutdown");
+
+		assert.equal(await readFile(configPath(), "utf8"), DAMAGED, "telegram.json must still exist, damaged, after the failed restore");
+		await rm(temporary, { recursive: true });
+		calls = [];
+		harness = createHarness();
+		await harness.emit("session_start");
+		await waitFor(() => calls.some((call) => call.method === "getUpdates"), "the bridge to connect");
+
+		assert.deepEqual(JSON.parse(await readFile(configPath(), "utf8")), GOOD_CONFIG);
+		const corrupt = (await readdir(agentDir)).filter((name) => name.startsWith("telegram.json.corrupt-"));
+		assert.ok(corrupt.length >= 1);
+		for (const name of corrupt) {
+			assert.equal(await readFile(join(agentDir, name), "utf8"), DAMAGED);
+			assert.equal(await fileMode(join(agentDir, name)), 0o600);
+		}
+	});
+
+	it("creates the backup at startup when a valid telegram.json has none", async () => {
+		const content = JSON.stringify(GOOD_CONFIG, null, "\t") + "\n";
+		await writeFile(configPath(), content, { mode: 0o600 });
+
+		harness = createHarness();
+		await harness.emit("session_start");
+
+		assert.equal(await readFile(backupPath(), "utf8"), content);
+		assert.equal(await fileMode(backupPath()), 0o600);
+	});
+
 	for (const [label, prepareBackup] of [
 		["missing", async () => undefined],
 		["damaged too", async () => writeFile(backupPath(), DAMAGED, { mode: 0o600 })],

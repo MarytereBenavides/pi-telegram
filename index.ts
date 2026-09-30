@@ -1,4 +1,4 @@
-import { chmod, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
 import { homedir } from "node:os";
 
@@ -387,7 +387,7 @@ function isMissingFile(error: unknown): boolean {
 	return (error as NodeJS.ErrnoException | undefined)?.code === "ENOENT";
 }
 
-async function readConfigFile(path: string): Promise<{ config?: TelegramConfig; missing?: true; error?: string }> {
+async function readConfigFile(path: string): Promise<{ config?: TelegramConfig; content?: string; missing?: true; error?: string }> {
 	let content: string;
 	try {
 		content = await readFile(path, "utf8");
@@ -398,7 +398,7 @@ async function readConfigFile(path: string): Promise<{ config?: TelegramConfig; 
 	try {
 		const parsed: unknown = JSON.parse(content);
 		if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return { error: "not a JSON object" };
-		return { config: parsed as TelegramConfig };
+		return { config: parsed as TelegramConfig, content };
 	} catch (error) {
 		return { error: error instanceof Error ? error.message : String(error) };
 	}
@@ -411,15 +411,35 @@ async function writeFileAtomic(path: string, content: string): Promise<void> {
 	await rename(temporary, path);
 }
 
+/** Copies a damaged config aside, owner-only from the first byte, without removing the original. */
+async function keepDamagedCopy(): Promise<string> {
+	const corruptPath = `${CONFIG_PATH}.corrupt-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+	await writeFile(corruptPath, await readFile(CONFIG_PATH), { mode: CONFIG_FILE_MODE, flag: "wx" });
+	return corruptPath;
+}
+
 /**
- * Reads CONFIG_PATH. A missing file is a fresh install. A damaged one is kept aside as
- * telegram.json.corrupt-<timestamp> and replaced by the backup, so the bridge stays up;
- * without a usable backup it is left untouched and further writes are blocked.
+ * Reads CONFIG_PATH. A missing file is a fresh install. A damaged one is copied aside as
+ * telegram.json.corrupt-<timestamp> and atomically replaced by the backup, so the bridge
+ * stays up and CONFIG_PATH never goes missing; without a usable backup it is left
+ * untouched and further writes are blocked.
  */
 export async function readConfig(): Promise<LoadedConfig> {
 	configWritesBlocked = false;
 	const main = await readConfigFile(CONFIG_PATH);
-	if (main.config) return { config: main.config };
+	if (main.config) {
+		// The first start after an upgrade has no backup yet: take it now, from a known good file,
+		// instead of waiting for a write that could be the one that goes wrong.
+		const backup = await readConfigFile(CONFIG_BACKUP_PATH);
+		if (backup.missing && main.content !== undefined) {
+			try {
+				await writeFileAtomic(CONFIG_BACKUP_PATH, main.content);
+			} catch (error) {
+				console.error(`pi-telegram: could not create ${CONFIG_BACKUP_PATH}: ${error instanceof Error ? error.message : String(error)}`);
+			}
+		}
+		return { config: main.config };
+	}
 	if (main.missing) return { config: {} };
 
 	console.error(`pi-telegram: ${CONFIG_PATH} is damaged (${main.error})`);
@@ -432,11 +452,16 @@ export async function readConfig(): Promise<LoadedConfig> {
 	}
 
 	const backupStats = await stat(CONFIG_BACKUP_PATH);
-	const corruptPath = `${CONFIG_PATH}.corrupt-${new Date().toISOString().replace(/[:.]/g, "-")}`;
-	await rename(CONFIG_PATH, corruptPath);
-	await chmod(corruptPath, CONFIG_FILE_MODE);
-	await writeFileAtomic(CONFIG_PATH, JSON.stringify(backup.config, null, "\t") + "\n");
-	console.error(`pi-telegram: restored ${CONFIG_PATH} from ${CONFIG_BACKUP_PATH}; the damaged file is ${corruptPath}`);
+	try {
+		// Copy first, then replace: the rename swaps CONFIG_PATH atomically, so a crash at any
+		// point leaves either the damaged file (restored again on the next start) or the good one.
+		const corruptPath = await keepDamagedCopy();
+		await writeFileAtomic(CONFIG_PATH, JSON.stringify(backup.config, null, "\t") + "\n");
+		console.error(`pi-telegram: restored ${CONFIG_PATH} from ${CONFIG_BACKUP_PATH}; the damaged file is ${corruptPath}`);
+	} catch (error) {
+		// The bridge still runs on the backup; the next start tries the restore again.
+		console.error(`pi-telegram: could not restore ${CONFIG_PATH} from ${CONFIG_BACKUP_PATH}: ${error instanceof Error ? error.message : String(error)}`);
+	}
 	return { config: backup.config, restoredFrom: backupStats.mtime };
 }
 
@@ -464,10 +489,8 @@ export async function writeConfig(config: TelegramConfig): Promise<void> {
 /** An explicit /telegram-setup replaces a damaged config; the damaged file is kept aside. */
 async function unblockConfigWrites(): Promise<void> {
 	if (!configWritesBlocked) return;
-	const corruptPath = `${CONFIG_PATH}.corrupt-${new Date().toISOString().replace(/[:.]/g, "-")}`;
 	try {
-		await rename(CONFIG_PATH, corruptPath);
-		await chmod(corruptPath, CONFIG_FILE_MODE);
+		await keepDamagedCopy();
 	} catch (error) {
 		if (!isMissingFile(error)) throw error;
 	}
